@@ -36,6 +36,17 @@ def start_scheduler():
     for spec in cfg.get('summarize', {}).get('cron', ['0 7 * * *','0 12 * * *','0 19 * * *']):
         sch.add_job(_run_summarize, CronTrigger.from_crontab(spec, timezone=tz))
 
+    # run once immediately before scheduling loop
+    logger.info('Scheduler warm-up: run translate and summarize once now')
+    try:
+        _run_translate()
+    except Exception as e:
+        logger.info(f"Warm-up translate failed: {e}")
+    try:
+        _run_summarize()
+    except Exception as e:
+        logger.info(f"Warm-up summarize failed: {e}")
+
     logger.info('Scheduler started. Press Ctrl+C to exit.')
     sch.start()
 

@@ -46,4 +46,7 @@ dist/
 # Unrelated projects (keep locally, not in this repo)
 kiss-translator/
 old-immersive-translate/
+
+# Runtime data
+/data/
 /error2.txt

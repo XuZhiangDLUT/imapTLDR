@@ -4,8 +4,32 @@ from typing import Generator, Iterable
 from openai import OpenAI
 from bs4 import BeautifulSoup
 import logging
+from datetime import datetime
+import json
+from pathlib import Path as _Path
 
 logger = logging.getLogger("mailbot")
+
+_ROOT = _Path(__file__).resolve().parents[1]
+_DATA_DIR = _ROOT / 'data'
+
+def _ensure_data_dir():
+    try:
+        _DATA_DIR.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+
+def _save_summary_payload(entries: list[dict]):
+    if not entries:
+        return
+    _ensure_data_dir()
+    ts = datetime.now().strftime('%Y%m%d-%H%M%S')
+    path = _DATA_DIR / f'summarize-{ts}.json'
+    try:
+        path.write_text(json.dumps(entries, ensure_ascii=False, indent=2), encoding='utf-8')
+        logger.info(f"Saved summarize payloads -> {path}")
+    except Exception as e:
+        logger.info(f"Failed to save summarize payloads: {e}")
 from .imap_client import (
     connect,
     list_unseen,
@@ -206,6 +230,7 @@ def summarize_job(cfg: dict):
     chunk_chars = int(cfg.get('summarize', {}).get('chunk_tokens', 16000))  # approx by chars
 
     c = connect(imap['server'], imap['email'], imap['password'], port=imap.get('port',993), ssl=imap.get('ssl',True))
+    submitted_entries: list[dict] = []
     try:
         for folder in folders:
             logger.info(f"Scanning folder (summarize): {folder}")
@@ -225,7 +250,23 @@ def summarize_job(cfg: dict):
                     continue
                 chunks = split_by_chars(plain, chunk_chars)
                 answers = []
-                for ch in chunks:
+                for idx, ch in enumerate(chunks):
+                    # record payload submitted to summarizer
+                    submitted_entries.append({
+                        'job': 'summarize',
+                        'folder': folder,
+                        'uid': uid,
+                        'subject': sub,
+                        'chunk_index': idx + 1,
+                        'chunk_total': len(chunks),
+                        'text': ch,
+                        'prompt': prompt,
+                        'model': model,
+                        'enable_thinking': bool(enable_thinking),
+                        'thinking_budget': int(thinking_budget),
+                        'when': datetime.now().isoformat(timespec='seconds'),
+                        'mock': bool(use_mock),
+                    })
                     if use_mock:
                         answers.append(summarize_mock(ch))
                     else:
@@ -250,4 +291,6 @@ def summarize_job(cfg: dict):
             c.logout()
         except Exception:
             pass
+    # save all submitted payloads for this run
+    _save_summary_payload(submitted_entries)
     logger.info("Summarize job finished")
