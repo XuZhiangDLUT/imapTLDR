@@ -18,6 +18,35 @@ def _has_ancestor_with_keywords(tag, keywords: tuple[str, ...]) -> bool:
     return False
 
 
+def _ancestor_has_colored_bg(tag) -> bool:
+    # Heuristic: banner/hero regions often have non-white backgrounds
+    cur = tag.parent
+    depth = 0
+    while cur is not None and depth < 6:
+        # bgcolor attribute
+        bgc = (cur.get('bgcolor') or '').strip().lower()
+        if bgc and bgc not in ('#fff', '#ffffff', 'white', 'transparent', 'none'):
+            return True
+        # inline background style
+        style = (cur.get('style') or '').lower()
+        if 'background' in style or 'background-color' in style:
+            val = style
+            # treat any non-white, non-transparent background as colored
+            if not any(y in val for y in ('#fff', '#ffffff', 'white', 'transparent')):
+                return True
+            # also catch darker named/hex/rgb forms
+            if any(x in val for x in ('#000', '#111', '#222', '#333', '#444', '#555', '#666', '#777', 'black')):
+                return True
+            if 'rgb(' in val and 'transparent' not in val and ('255, 255, 255' not in val and '255,255,255' not in val):
+                return True
+        # tables with explicit background often form hero bars
+        if cur.name in ('table', 'td') and (bgc or ('background' in (cur.get('style') or '').lower())):
+            return True
+        cur = cur.parent
+        depth += 1
+    return False
+
+
 def _is_textual_block(tag) -> bool:
     # Skip blocks that likely contain layout-heavy elements
     if tag.find_parent("blockquote"):
@@ -30,6 +59,9 @@ def _is_textual_block(tag) -> bool:
         "unsubscribe", "privacy", "copyright", "legal", "terms", "support", "help",
         "social", "share"
     )):
+        return False
+    # Skip inside non-white background regions (likely hero/banner)
+    if _ancestor_has_colored_bg(tag):
         return False
     style = (tag.get("style", "") or "").lower()
     if any(k in style for k in ("position:absolute", "position:fixed", "float:")):

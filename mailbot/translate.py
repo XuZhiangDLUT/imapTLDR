@@ -28,6 +28,27 @@ def _has_ancestor_with_keywords(tag, keywords: tuple[str, ...]) -> bool:
     return False
 
 
+def _ancestor_has_colored_bg(tag) -> bool:
+    cur = tag.parent
+    depth = 0
+    while cur is not None and depth < 6:
+        bgc = (cur.get('bgcolor') or '').strip().lower()
+        if bgc and bgc not in ('#fff', '#ffffff', 'white', 'transparent', 'none'):
+            return True
+        style = (cur.get('style') or '').lower()
+        if 'background' in style or 'background-color' in style:
+            val = style
+            if any(x in val for x in ('#000', '#111', '#222', '#333', '#444', '#555', '#666', 'black')) and not any(y in val for y in ('#fff', '#ffffff', 'white', 'transparent')):
+                return True
+            if 'rgb(' in val and '255, 255, 255' not in val and '255,255,255' not in val and 'transparent' not in val:
+                return True
+        if cur.name in ('table', 'td') and (bgc or ('background' in (cur.get('style') or '').lower())):
+            return True
+        cur = cur.parent
+        depth += 1
+    return False
+
+
 def _should_inject(tag) -> bool:
     if tag.find_parent("blockquote"):
         return False
@@ -38,7 +59,13 @@ def _should_inject(tag) -> bool:
         "social", "share"
     )):
         return False
+    # avoid hero/banner areas with colored background
+    if _ancestor_has_colored_bg(tag):
+        return False
     style = (tag.get("style", "") or "").lower()
+    # if tag itself has non-white background, skip as well
+    if ('background' in style or 'background-color' in style) and not any(x in style for x in ('white', '#fff', '#ffffff', 'transparent')):
+        return False
     if any(k in style for k in ("position:absolute", "position:fixed", "float:")):
         return False
     text = tag.get_text(" ", strip=True)
