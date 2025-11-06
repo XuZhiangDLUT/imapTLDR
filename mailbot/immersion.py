@@ -3,8 +3,8 @@ from bs4 import BeautifulSoup
 from premailer import transform as inline_css
 
 # Safer immersive injection: only target text blocks; avoid duplicating large containers
-# Extremely conservative: only p/li to avoid headline/hero injection
-BLOCK_SEL = "p, li"
+# Balanced: include p/li and sub-headings (h2/h3); still avoid h1/hero
+BLOCK_SEL = "p, li, h2, h3"
 
 
 def _has_ancestor_with_keywords(tag, keywords: tuple[str, ...]) -> bool:

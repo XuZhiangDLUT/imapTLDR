@@ -81,7 +81,7 @@ def extract_segments_from_html(html: str) -> list[str]:
     soup = BeautifulSoup(html, "html5lib")
     # simple paragraph segmentation; skip empty
     segs = []
-    for tag in soup.find_all(["p", "li"]):  # conservative: only p/li
+    for tag in soup.find_all(["p", "li", "h2", "h3"]):  # balanced: include sub-headings
         text = tag.get_text(" ", strip=True)
         if text:
             segs.append(text)
@@ -96,7 +96,7 @@ def extract_segments_from_html(html: str) -> list[str]:
 def render_bilingual_html(original_html: str, translations: list[str]) -> str:
     soup = BeautifulSoup(original_html, "html5lib")
     idx = 0
-    for tag in soup.find_all(["p", "li"]):  # conservative: only p/li
+    for tag in soup.find_all(["p", "li", "h2", "h3"]):  # balanced: include sub-headings
         if not _should_inject(tag):
             continue
         text = tag.get_text(" ", strip=True)
