@@ -1,6 +1,6 @@
 from __future__ import annotations
 from pathlib import Path
-from typing import Generator, Iterable
+from typing import Iterable
 from openai import OpenAI
 from bs4 import BeautifulSoup
 import logging
@@ -14,27 +14,30 @@ logger = logging.getLogger("mailbot")
 _ROOT = _Path(__file__).resolve().parents[1]
 _DATA_DIR = _ROOT / 'data'
 
+
 def _ensure_data_dir():
     try:
         _DATA_DIR.mkdir(parents=True, exist_ok=True)
     except Exception:
         pass
 
-def _save_summary_payload(entries: list[dict]):
-    if not entries:
-        return
+
+def _save_summary_payload(entries: list[dict], path: Path | None = None, meta: dict | None = None):
+    # Always persist a record file for observability, even if empty
     _ensure_data_dir()
-    ts = datetime.now().strftime('%Y%m%d-%H%M%S')
-    path = _DATA_DIR / f'summarize-{ts}.json'
+    if path is None:
+        ts = datetime.now().strftime('%Y%m%d-%H%M%S')
+        path = _DATA_DIR / f'summarize-{ts}.json'
+    payload = {"meta": meta or {}, "entries": entries or []}
     try:
-        path.write_text(json.dumps(entries, ensure_ascii=False, indent=2), encoding='utf-8')
+        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding='utf-8')
         logger.info(f"Saved summarize payloads -> {path}")
     except Exception as e:
         logger.info(f"Failed to save summarize payloads: {e}")
 
 
 def _render_summary_html(items: list[tuple[object, str]], folder: str) -> str:
-    # items: list of (message, summary_text)
+    # items: list of (message, summary_text or rendered HTML)
     now = datetime.now().strftime('%Y-%m-%d %H:%M')
     def _bullets(text: str) -> str:
         lines = [l.strip() for l in (text or '').splitlines()]
@@ -47,10 +50,50 @@ def _render_summary_html(items: list[tuple[object, str]], folder: str) -> str:
             lis.append(f"<li>{l}</li>")
         return "<ul style=\"margin:0; padding-left:18px;\">" + "".join(lis) + "</ul>"
 
+    def _card(a: dict) -> str:
+        tzh = (a.get('title_zh') or '').strip()
+        ten = (a.get('title_en') or '').strip()
+        authors = (a.get('authors') or '').strip()
+        bullets = [b for b in (a.get('bullets') or []) if (b or '').strip()]
+        rel = (a.get('relevance') or '').strip()
+        lis = ''.join(f"<li>{b}</li>" for b in bullets[:3])
+        return f"""
+<div style=\"border:1px solid #e5e7eb;border-radius:10px;padding:10px 12px;margin:10px 0;\">
+  <div style=\"font-weight:700;font-size:15px;line-height:1.35;margin-bottom:6px;\">
+    <span style=\"color:#111827;\">中文标题：</span><span style=\"color:#111827;\">{tzh}</span>
+  </div>
+  <div style=\"font-size:12px;color:#374151;margin-bottom:4px;\">English Title: {ten}</div>
+  <div style=\"font-size:12px;color:#6b7280;margin-bottom:6px;\">Authors: {authors}</div>
+  <div>
+    <div style=\"font-weight:600;color:#111827;margin-bottom:4px;\">要点</div>
+    <ul style=\"margin:0;padding-left:18px;\">{lis}</ul>
+    <div style=\"font-size:12px;color:#059669;margin-top:6px;\">相关性：{rel}</div>
+  </div>
+</div>
+"""
+
+    def _cards(articles: list[dict]) -> str:
+        if not articles:
+            return ""
+        return "".join(_card(a) for a in articles)
+
+    def _safe_json_loads(s: str):
+        try:
+            import json as _json
+            return _json.loads(s)
+        except Exception:
+            return None
+
+    def _looks_like_html(s: str) -> bool:
+        if not s:
+            return False
+        s = s.strip()
+        return s.startswith('<') and ('</' in s or '/>' in s)
+
     cards = []
     for m, summ in items:
         subj = decode_subject(m)
-        body = _bullets(summ) if summ else "<div style=\"color:#888;\">(empty)</div>"
+        body = (summ if _looks_like_html(summ) else _bullets(summ)) if summ else "<div style=\"color:#888;\">(empty)</div>"
         cards.append(
             f"""
             <li style=\"margin-bottom:14px;\">
@@ -76,109 +119,48 @@ def _render_summary_html(items: list[tuple[object, str]], folder: str) -> str:
     """
     return inline_css(html)
 
+
 from .imap_client import (
     connect,
     list_unseen,
+    search_unseen_without_prefix,
     fetch_raw,
     parse_message,
     pick_html_or_text,
     build_email,
     append_unseen,
     mark_seen,
-    has_linked_reply,
 )
-from .immersion import inject_bilingual_html
-from .utils import decode_subject, pass_prefix, split_by_chars
-from .mock_llm import translate_batch_mock, summarize_mock
+from .utils import decode_subject, pass_prefix, split_by_chars, rough_token_count
+from .mock_llm import summarize_mock
 
 
-# --- scanning helpers ---
-
-DEFAULT_TRANSLATE_FOLDERS = [
-    "IJSS","TWS","JMPS","EML","PRL","IJMS","IJNME","CMAME","ComputerStruct","SMO",
-    "ES","NLDyna","JSV","IJIE","OceanEng","Def. Technol.","Eur.J.Mech.","CompositeStruct",
-]
 DEFAULT_SUMMARY_FOLDERS = [
     "其他文件夹/Nature","其他文件夹/APS Extended","其他文件夹/PNAS","其他文件夹/Science",
     "其他文件夹/Materials","其他文件夹/AFM","其他文件夹/AdvMaterial","其他文件夹/R. Soc. A","其他文件夹/Adv.Sci.",
 ]
 
 
-def scan_translate_targets(c, cfg: dict, excluded_prefixes: Iterable[str]) -> Generator[tuple[str,int,object], None, None]:
-    imap = cfg['imap']
-    translate_cfg = cfg.get('translate', {})
-    folders = translate_cfg.get('folders', DEFAULT_TRANSLATE_FOLDERS)
-    max_per = int(translate_cfg.get('max_per_run_per_folder', 3))
-
-    # normal folders
-    for folder in folders:
-        target_folder = folder if folder.startswith('INBOX') or folder.startswith('其他文件夹/') else f"其他文件夹/{folder}"
-        logger.info(f"Scanning folder: {target_folder}")
-        uids = list_unseen(c, target_folder)
-        count = 0
-        for uid in uids:
-            raw = fetch_raw(c, uid)
-            msg = parse_message(raw)
-            sub = decode_subject(msg)
-            if not pass_prefix(sub, excluded_prefixes):
-                continue
-            logger.info(f"Detected subject (translate): {sub} (uid={uid})")
-            yield (target_folder, uid, msg)
-            count += 1
-            if count >= max_per:
-                break
-
-    # INBOX keyword channel
-    inbox_keywords = translate_cfg.get('inbox_keywords', ["相关研究汇总","快讯汇总"])
-    inbox_froms = translate_cfg.get('inbox_from', ["scholaralerts-noreply@google.com"]) 
-    uids = list_unseen(c, 'INBOX')
-    logger.info("Scanning folder: INBOX (keyword channel)")
-    for uid in uids:
-        raw = fetch_raw(c, uid)
-        msg = parse_message(raw)
-        sub = decode_subject(msg)
-        if not pass_prefix(sub, excluded_prefixes):
-            continue
-        sender = str(msg.get('From', ''))
-        if any(k in sub for k in inbox_keywords) or any(f in sender for f in inbox_froms):
-            logger.info(f"Detected subject (translate INBOX): {sub} (from={sender}, uid={uid})")
-            yield ('INBOX', uid, msg)
-
-
-# --- LLM helpers ---
-
-def new_openai(base_url: str, api_key: str, timeout: float | int = 15.0) -> OpenAI:
-    base = base_url.rstrip('/')
+def new_openai(api_base: str, api_key: str, timeout: float | int = 15.0) -> OpenAI:
+    base = api_base.rstrip('/')
     if not base.endswith('/v1'):
         base += '/v1'
-    # configurable timeout (default 15s)
     logger.info(f"Initialize LLM client base={base}")
     return OpenAI(base_url=base, api_key=api_key, timeout=timeout)
 
 
-def qwen_translate_batch(cli: OpenAI, model: str, segments: list[str], timeout: float | int = 15.0) -> list[str]:
-    if not segments:
-        return []
-    sys = "严格逐段翻译为中文。保持数字、专有名词与标点。不要添加解释。"
-    user = "\n\n-----\n\n".join(segments)
-    try:
-        r = cli.chat.completions.create(
-            model=model, temperature=0.2,
-            messages=[{"role":"system","content":sys},{"role":"user","content":user}],
-            timeout=timeout,
-        )
-        out = (r.choices[0].message.content or '').split("\n\n-----\n\n")
-    except Exception as e:
-        logger.info(f"LLM translate error or timeout: {e}")
-        # fallback: return empty translations to avoid blocking tests
-        out = [''] * len(segments)
-    if len(out) < len(segments):
-        out += ['']*(len(segments)-len(out))
-    return [s.strip() for s in out][:len(segments)]
-
-
-def deepseek_summarize(cli: OpenAI, model: str, prompt: str, text: str, enable_thinking: bool, thinking_budget: int, timeout: float | int = 15.0) -> str:
+def deepseek_summarize(cli: OpenAI, model: str, prompt: str, text: str, enable_thinking: bool, thinking_budget: int, timeout: float | int = 15.0, expect_json: bool = False) -> tuple[str, str]:
     extra = {"enable_thinking": enable_thinking, "thinking_budget": thinking_budget} if enable_thinking else {}
+    if expect_json:
+        try:
+            # many OpenAI-compatible providers support JSON mode via response_format
+            rf = {"type": "json_object"}
+            if extra:
+                extra = {**extra, "response_format": rf}
+            else:
+                extra = {"response_format": rf}
+        except Exception:
+            pass
     try:
         r = cli.chat.completions.create(
             model=model, temperature=0.2,
@@ -186,67 +168,23 @@ def deepseek_summarize(cli: OpenAI, model: str, prompt: str, text: str, enable_t
             extra_body=extra or None,
             timeout=timeout,
         )
-        return r.choices[0].message.content or ''
+        msg = r.choices[0].message
+        content = (getattr(msg, 'content', None) or '')
+        # best-effort extract provider-specific thinking output
+        thinking = ''
+        try:
+            if hasattr(msg, 'reasoning_content'):
+                thinking = getattr(msg, 'reasoning_content') or ''
+            else:
+                d = msg.model_dump(exclude_none=True) if hasattr(msg, 'model_dump') else getattr(msg, '__dict__', {})
+                if isinstance(d, dict):
+                    thinking = d.get('reasoning_content') or d.get('thinking') or ''
+        except Exception:
+            thinking = ''
+        return content, thinking
     except Exception as e:
         logger.info(f"LLM summarize error or timeout: {e}")
-        return '(summary timeout or error)'
-
-
-# --- Jobs ---
-
-def translate_job(cfg: dict):
-    logger.info("Translate job started")
-    imap = cfg['imap']; pref = cfg.get('prefix', {'translate':'[机器翻译]','summarize':'[机器总结]'})
-    excluded = [pref.get('translate','[机器翻译]'), pref.get('summarize','[机器总结]')]
-    sf = cfg.get('llm', {}).get('siliconflow') or cfg.get('siliconflow2') or cfg.get('siliconflow')
-    use_mock = bool(cfg.get('llm', {}).get('mock', False) or cfg.get('test', {}).get('mock_llm', False))
-    llm_cfg = cfg.get('llm', {})
-    translate_timeout = float(llm_cfg.get('translate_timeout_seconds', llm_cfg.get('request_timeout_seconds', 15.0)))
-    if not use_mock:
-        if sf is None:
-            # backwards compat
-            sf = cfg.get('siliconflow2') or cfg.get('siliconflow')
-            cli = new_openai(sf['api_base'], sf['api_key'], timeout=translate_timeout)
-            trans_model = cfg.get('llm', {}).get('translator_model') or sf.get('model')
-        else:
-            cli = new_openai(sf['api_base'], sf['api_key'], timeout=translate_timeout)
-            trans_model = cfg.get('llm', {}).get('translator_model') or cfg.get('siliconflow2',{}).get('model') or 'Qwen/Qwen2.5-7B-Instruct'
-
-    c = connect(imap['server'], imap['email'], imap['password'], port=imap.get('port',993), ssl=imap.get('ssl',True))
-    try:
-        for folder, uid, msg in scan_translate_targets(c, cfg, excluded):
-            sub = decode_subject(msg)
-            logger.info(f"Processing subject (translate): {sub} in {folder} (uid={uid})")
-            html, text = pick_html_or_text(msg)
-            if not html and text:
-                html = f"<html><body><pre>{text}</pre></body></html>"
-            if not html:
-                logger.info("Skip empty body; mark seen")
-                mark_seen(c, folder, uid)
-                continue
-
-            # idempotency: skip if already handled
-            orig_msgid = msg.get('Message-ID') or ''
-            if orig_msgid and has_linked_reply(c, folder, orig_msgid, pref.get('translate','[机器翻译]')):
-                logger.info("Skip already translated (idempotent)")
-                mark_seen(c, folder, uid)
-                continue
-
-            if use_mock:
-                zh_html = inject_bilingual_html(html, translate_batch_mock)
-            else:
-                zh_html = inject_bilingual_html(html, lambda segs: qwen_translate_batch(cli, trans_model, segs, timeout=translate_timeout))
-            new_subject = f"{pref.get('translate','[机器翻译]')} {sub}"
-            out = build_email(new_subject, imap['email'], imap['email'], zh_html, None, in_reply_to=msg.get('Message-ID'))
-            append_unseen(c, folder or 'INBOX', out)
-            mark_seen(c, folder, uid)
-            logger.info(f"Appended translated mail: {new_subject}")
-    finally:
-        try:
-            c.logout()
-        except Exception:
-            pass
-    logger.info("Translate job finished")
+        return '(summary timeout or error)', ''
 
 
 def summarize_job(cfg: dict):
@@ -277,10 +215,37 @@ def summarize_job(cfg: dict):
 
     c = connect(imap['server'], imap['email'], imap['password'], port=imap.get('port',993), ssl=imap.get('ssl',True))
     submitted_entries: list[dict] = []
+    # create a run file early with meta for visibility
+    _run_start = datetime.now()
+    _run_ts = _run_start.strftime('%Y%m%d-%H%M%S')
+    _run_path = _DATA_DIR / f'summarize-{_run_ts}.json'
+    _meta = {
+        'mode': 'job',
+        'folders': folders,
+        'batch_size': batch_size,
+        'chunk_chars': chunk_chars,
+        'model': model,
+        'enable_thinking': bool(enable_thinking),
+        'mock': bool(use_mock),
+        'start_time': _run_start.isoformat(timespec='seconds'),
+        'run_id': _run_ts,
+        'entries_written': 0,
+    }
+    _save_summary_payload([], path=_run_path, meta=_meta)
     try:
         for folder in folders:
             logger.info(f"Scanning folder (summarize): {folder}")
-            uids = list_unseen(c, folder)
+            # robust unseen enumeration to avoid server SEARCH limits
+            fetch_chunk = int(cfg.get('summarize', {}).get('unseen_fetch_chunk', 500))
+            uids = search_unseen_without_prefix(c, folder, exclude_auto_generated=True, robust=True, fetch_chunk=fetch_chunk)
+            logger.info(f"Found UNSEEN (robust, auto-generated excluded): {len(uids)}")
+            # Optional cap per folder
+            cfg_sum = cfg.get('summarize', {})
+            max_per = int(cfg_sum.get('max_unseen_per_run_per_folder', 0) or 0)
+            order = str(cfg_sum.get('scan_order', 'newest')).lower()
+            if max_per > 0 and len(uids) > max_per:
+                uids = uids[-max_per:] if order == 'newest' else uids[:max_per]
+                logger.info(f"Apply cap: take {len(uids)} ({order})")
             pairs = []
             for uid in uids:
                 raw = fetch_raw(c, uid)
@@ -294,10 +259,29 @@ def summarize_job(cfg: dict):
                 if not plain:
                     mark_seen(c, folder, uid)
                     continue
+                total_chars = len(plain)
+                total_tokens = rough_token_count(plain)
                 chunks = split_by_chars(plain, chunk_chars)
-                answers = []
+                logger.info(f"Summarize plan: chars={total_chars}, ~tokens={total_tokens}, chunks={len(chunks)} x <= {chunk_chars} chars")
+                answers_texts: list[str] = []
+                aggregated_articles: list[dict] = []
                 for idx, ch in enumerate(chunks):
-                    # record payload submitted to summarizer
+                    c_chars = len(ch)
+                    c_tokens = rough_token_count(ch)
+                    logger.info(f"Chunk {idx+1}/{len(chunks)}: chars={c_chars}, ~tokens={c_tokens}")
+                    if use_mock:
+                        summary, thinking = summarize_mock(ch), ''
+                        parsed = None
+                    else:
+                        summary, thinking = deepseek_summarize(cli, model, prompt, ch, enable_thinking, thinking_budget, timeout=summarize_timeout, expect_json=True)
+                        # try parse json articles
+                        parsed = None
+                        try:
+                            import json as _json
+                            parsed = _json.loads(summary)
+                        except Exception:
+                            parsed = None
+                    # record payload + model outputs
                     submitted_entries.append({
                         'job': 'summarize',
                         'folder': folder,
@@ -306,18 +290,38 @@ def summarize_job(cfg: dict):
                         'chunk_index': idx + 1,
                         'chunk_total': len(chunks),
                         'text': ch,
+                        'chars': c_chars,
+                        'approx_tokens': c_tokens,
                         'prompt': prompt,
                         'model': model,
                         'enable_thinking': bool(enable_thinking),
                         'thinking_budget': int(thinking_budget),
+                        'thinking': thinking,
+                        'answer': summary,
                         'when': datetime.now().isoformat(timespec='seconds'),
                         'mock': bool(use_mock),
                     })
-                    if use_mock:
-                        answers.append(summarize_mock(ch))
+                    if parsed and isinstance(parsed.get('articles'), list):
+                        # accumulate articles for this message
+                        aggregated_articles.extend([a for a in parsed['articles'] if isinstance(a, dict)])
                     else:
-                        answers.append(deepseek_summarize(cli, model, prompt, ch, enable_thinking, thinking_budget, timeout=summarize_timeout))
-                pairs.append((uid, msg, '\n\n'.join(answers)))
+                        answers_texts.append(summary)
+                # prefer JSON-rendered cards when available
+                if aggregated_articles:
+                    # dedupe by English title to avoid duplicates across chunks
+                    seen = set(); uniq = []
+                    for a in aggregated_articles:
+                        key = (a.get('title_en') or '').strip().lower()
+                        if key and key not in seen:
+                            seen.add(key); uniq.append(a)
+                    # cap to 12 for readability
+                    cards_html = ''.join([
+                        f"<div style=\"border:1px solid #e5e7eb;border-radius:10px;padding:10px 12px;margin:10px 0;\"><div style=\"font-weight:700;font-size:15px;line-height:1.35;margin-bottom:6px;\"><span style=\"color:#111827;\">中文标题：</span><span style=\"color:#111827;\">{(a.get('title_zh') or '').strip()}</span></div><div style=\"font-size:12px;color:#374151;margin-bottom:4px;\">English Title: {(a.get('title_en') or '').strip()}</div><div style=\"font-size:12px;color:#6b7280;margin-bottom:6px;\">Authors: {(a.get('authors') or '').strip()}</div><div><div style=\"font-weight:600;color:#111827;margin-bottom:4px;\">要点</div><ul style=\"margin:0;padding-left:18px;\">{''.join(f'<li>{b}</li>' for b in (a.get('bullets') or []) if (b or '').strip())}</ul><div style=\"font-size:12px;color:#059669;margin-top:6px;\">相关性：{(a.get('relevance') or '').strip()}</div></div></div>"
+                        for a in uniq[:12]
+                    ])
+                    pairs.append((uid, msg, cards_html))
+                else:
+                    pairs.append((uid, msg, '\n\n'.join(answers_texts)))
 
             for i in range(0, len(pairs), batch_size):
                 batch = pairs[i:i+batch_size]
@@ -330,11 +334,18 @@ def summarize_job(cfg: dict):
                 logger.info(f"Appended summary: {subject}")
                 for uid, _, _ in batch:
                     mark_seen(c, folder, uid)
+                # checkpoint after each batch
+                _meta['entries_written'] = len(submitted_entries)
+                _meta['last_update'] = datetime.now().isoformat(timespec='seconds')
+                _save_summary_payload(submitted_entries, path=_run_path, meta=_meta)
     finally:
         try:
             c.logout()
         except Exception:
             pass
-    # save all submitted payloads for this run
-    _save_summary_payload(submitted_entries)
+    # finalize payloads for this run
+    _meta['entries_written'] = len(submitted_entries)
+    _meta['end_time'] = datetime.now().isoformat(timespec='seconds')
+    _save_summary_payload(submitted_entries, path=_run_path, meta=_meta)
     logger.info("Summarize job finished")
+

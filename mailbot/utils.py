@@ -38,3 +38,20 @@ def split_by_chars(text: str, limit: int) -> list[str]:
         out.append(text[i:i+limit])
         i += limit
     return out
+
+
+def rough_token_count(text: str) -> int:
+    """Heuristic token estimator.
+    - If mostly ASCII, assume ~4 chars per token
+    - Otherwise (CJK-heavy), assume ~1 char per token
+    """
+    if not text:
+        return 0
+    try:
+        ascii_chars = sum(1 for ch in text if ord(ch) < 128)
+        ratio = ascii_chars / max(1, len(text))
+    except Exception:
+        ratio = 0.0
+    if ratio >= 0.7:
+        return max(1, int(round(len(text) / 4)))
+    return len(text)

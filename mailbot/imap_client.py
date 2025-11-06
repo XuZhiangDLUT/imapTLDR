@@ -4,7 +4,7 @@ from email import policy
 from email.message import EmailMessage
 from email.utils import make_msgid
 from typing import Iterable
-
+from itertools import islice
 
 def connect(host: str, user: str, password: str, port: int = 993, ssl: bool = True) -> IMAPClient:
     client = IMAPClient(host, port=port, ssl=ssl)
@@ -22,12 +22,39 @@ def search_unseen_without_prefix(
     folder: str,
     exclude_prefixes: Iterable[str] | None = None,
     keywords: list[str] | None = None,
+    exclude_auto_generated: bool = True,
+    robust: bool = False,
+    fetch_chunk: int = 500,
 ) -> list[int]:
     client.select_folder(folder)
+    if robust:
+        return list_unseen_robust(client, folder, exclude_auto_generated=exclude_auto_generated, fetch_chunk=fetch_chunk)
     # Avoid non-ASCII in SEARCH to keep QQ IMAP happy: fetch UNSEEN only, filter client-side
     crit: list[str] = ["UNSEEN"]
-    # Keywords omitted in SEARCH to avoid UTF-8 literals; can be filtered client-side if needed
-    return client.search(crit)
+    # Try server-side exclusion of auto-generated to reduce noise (ASCII-only)
+    if exclude_auto_generated:
+        try:
+            return client.search(["UNSEEN", "NOT", "HEADER", "Auto-Submitted", "auto-generated"])  # type: ignore
+        except Exception:
+            pass
+    uids = client.search(crit)
+    if exclude_auto_generated and uids:
+        # client-side filter by header
+        try:
+            data = client.fetch(uids, [b'BODY.PEEK[HEADER]'])
+            kept = []
+            for uid in uids:
+                try:
+                    hdr = BytesParser(policy=policy.default).parsebytes(data[uid][b'BODY[HEADER]'])
+                    if str(hdr.get('Auto-Submitted','') or '').lower().strip() == 'auto-generated':
+                        continue
+                    kept.append(uid)
+                except Exception:
+                    kept.append(uid)
+            return kept
+        except Exception:
+            return uids
+    return uids
 
 
 def fetch_raw(client: IMAPClient, uid: int) -> bytes:
@@ -156,10 +183,30 @@ def mark_unseen(client: IMAPClient, folder: str, uid: int):
     client.remove_flags([uid], [b"\\Seen"])  # ensure unread
 
 
-def list_unseen(client: IMAPClient, folder: str) -> list[int]:
+def list_unseen(client: IMAPClient, folder: str, exclude_auto_generated: bool = False) -> list[int]:
     client.select_folder(folder)
-    return client.search(["UNSEEN"])
-
+    if exclude_auto_generated:
+        try:
+            return client.search(["UNSEEN", "NOT", "HEADER", "Auto-Submitted", "auto-generated"])  # type: ignore
+        except Exception:
+            pass
+    uids = client.search(["UNSEEN"])
+    if exclude_auto_generated and uids:
+        try:
+            data = client.fetch(uids, [b'BODY.PEEK[HEADER]'])
+            kept = []
+            for uid in uids:
+                try:
+                    hdr = BytesParser(policy=policy.default).parsebytes(data[uid][b'BODY[HEADER]'])
+                    if str(hdr.get('Auto-Submitted','') or '').lower().strip() == 'auto-generated':
+                        continue
+                    kept.append(uid)
+                except Exception:
+                    kept.append(uid)
+            return kept
+        except Exception:
+            return uids
+    return uids
 
 def has_linked_reply(client: IMAPClient, folder: str, orig_msgid: str, prefix: str) -> bool:
     client.select_folder(folder)
@@ -169,7 +216,7 @@ def has_linked_reply(client: IMAPClient, folder: str, orig_msgid: str, prefix: s
         return False
     if not uids:
         return False
-    tail = uids[-100:] if len(uids) > 100 else uids
+    tail = uids[-200:] if len(uids) > 200 else uids
     data = client.fetch(tail, [b'BODY.PEEK[HEADER]'])
     for uid in data:
         hdr = BytesParser(policy=policy.default).parsebytes(data[uid][b'BODY[HEADER]'])
@@ -177,3 +224,51 @@ def has_linked_reply(client: IMAPClient, folder: str, orig_msgid: str, prefix: s
         if sub.startswith(prefix) and hdr.get('X-Linked-Message-Id','') == orig_msgid:
             return True
     return False
+
+
+def list_unseen_robust(client: IMAPClient, folder: str, exclude_auto_generated: bool = True, fetch_chunk: int = 500) -> list[int]:
+    """Robust UNSEEN enumeration by fetching FLAGS over ALL UIDs in chunks.
+    Works around server SEARCH limits by client-side filtering.
+    """
+    client.select_folder(folder)
+    try:
+        all_uids = client.search(['ALL'])
+    except Exception:
+        return []
+    if not all_uids:
+        return []
+    unseen: list[int] = []
+    step = max(1, int(fetch_chunk))
+    for i in range(0, len(all_uids), step):
+        chunk = all_uids[i:i+step]
+        try:
+            data = client.fetch(chunk, [b'FLAGS'])
+        except Exception:
+            continue
+        for uid in chunk:
+            try:
+                flags = data[uid][b'FLAGS']
+                if b'\\Seen' not in flags:
+                    unseen.append(uid)
+            except Exception:
+                unseen.append(uid)
+    if exclude_auto_generated and unseen:
+        kept: list[int] = []
+        step = max(1, int(fetch_chunk))
+        for i in range(0, len(unseen), step):
+            chunk = unseen[i:i+step]
+            try:
+                data = client.fetch(chunk, [b'BODY.PEEK[HEADER]'])
+            except Exception:
+                kept.extend(chunk)
+                continue
+            for uid in chunk:
+                try:
+                    hdr = BytesParser(policy=policy.default).parsebytes(data[uid][b'BODY[HEADER]'])
+                    if str(hdr.get('Auto-Submitted','') or '').lower().strip() == 'auto-generated':
+                        continue
+                    kept.append(uid)
+                except Exception:
+                    kept.append(uid)
+        unseen = kept
+    return unseen

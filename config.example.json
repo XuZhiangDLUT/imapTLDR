@@ -7,20 +7,9 @@
     "password": "YOUR_IMAP_AUTH_CODE",
     "folder": "INBOX"
   },
-  "prefix": { "translate": "[机器翻译]", "summarize": "[机器总结]" },
+  "prefix": { "summarize": "[机器总结]" },
   "timezone": "Asia/Shanghai",
 
-  "translate": {
-    "interval_minutes": 10,
-    "folders": [
-      "IJSS", "TWS", "JMPS", "EML", "PRL", "IJMS", "IJNME",
-      "CMAME", "ComputerStruct", "SMO", "ES", "NLDyna", "JSV",
-      "IJIE", "OceanEng", "Def. Technol.", "Eur.J.Mech.", "CompositeStruct"
-    ],
-    "inbox_keywords": ["相关研究汇总", "快讯汇总"],
-    "inbox_from": ["scholaralerts-noreply@google.com"],
-    "max_per_run_per_folder": 3
-  },
 
   "summarize": {
     "cron": ["0 7 * * *", "0 12 * * *", "0 19 * * *"],
@@ -36,7 +25,10 @@
       "其他文件夹/Adv.Sci."
     ],
     "batch_size": 10,
-    "chunk_tokens": 16000
+    "chunk_tokens": 16000,
+    "unseen_fetch_chunk": 500,
+    "max_unseen_per_run_per_folder": 0,
+    "scan_order": "newest"
   },
 
   "llm": {
@@ -46,24 +38,11 @@
       "api_key": "YOUR_SILICONFLOW_API_KEY",
       "model": "deepseek-ai/DeepSeek-V3.2-Exp"
     },
-    "translator_model": "Qwen/Qwen2.5-7B-Instruct",
     "summarizer_model": "deepseek-ai/DeepSeek-V3.2-Exp",
     "enable_thinking": true,
     "thinking_budget": 4096,
     "prompt_file": "Prompt.txt",
     "request_timeout_seconds": 15,
-    "translate_timeout_seconds": 15,
     "summarize_timeout_seconds": 15
-  },
-
-  "siliconflow": {
-    "api_base": "https://api.siliconflow.cn",
-    "model": "deepseek-ai/DeepSeek-V3.2-Exp",
-    "api_key": "YOUR_SILICONFLOW_API_KEY"
-  },
-  "siliconflow2": {
-    "api_base": "https://api.siliconflow.cn",
-    "model": "Qwen/Qwen2.5-7B-Instruct",
-    "api_key": "YOUR_SILICONFLOW_API_KEY"
   }
 }
