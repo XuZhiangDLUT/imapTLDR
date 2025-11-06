@@ -16,6 +16,40 @@ import logging
 logger = logging.getLogger("mailbot")
 
 
+def _has_ancestor_with_keywords(tag, keywords: tuple[str, ...]) -> bool:
+    cur = tag
+    depth = 0
+    while cur and depth < 6:
+        attrs = (" ".join(cur.get("class", [])).lower() + " " + str(cur.get("id", "")).lower()).strip()
+        if any(k in attrs for k in keywords):
+            return True
+        cur = cur.parent
+        depth += 1
+    return False
+
+
+def _should_inject(tag) -> bool:
+    if tag.find_parent("blockquote"):
+        return False
+    # avoid header/footer/nav/legal blocks
+    if _has_ancestor_with_keywords(tag, (
+        "header", "footer", "nav", "menu", "banner", "masthead", "logo", "brand",
+        "unsubscribe", "privacy", "copyright", "legal", "terms", "support", "help",
+        "social", "share"
+    )):
+        return False
+    style = (tag.get("style", "") or "").lower()
+    if any(k in style for k in ("position:absolute", "position:fixed", "float:")):
+        return False
+    text = tag.get_text(" ", strip=True)
+    if not text or len(text) < 6:
+        return False
+    low = text.lower()
+    if any(w in low for w in ("unsubscribe", "privacy", "copyright", "all rights reserved", "terms and conditions")):
+        return False
+    return True
+
+
 def extract_segments_from_html(html: str) -> list[str]:
     soup = BeautifulSoup(html, "html5lib")
     # simple paragraph segmentation; skip empty
@@ -36,6 +70,8 @@ def render_bilingual_html(original_html: str, translations: list[str]) -> str:
     soup = BeautifulSoup(original_html, "html5lib")
     idx = 0
     for tag in soup.find_all(["p", "li", "h1", "h2", "h3"]):
+        if not _should_inject(tag):
+            continue
         text = tag.get_text(" ", strip=True)
         if not text:
             continue
@@ -46,7 +82,10 @@ def render_bilingual_html(original_html: str, translations: list[str]) -> str:
         # insert translated line after the original
         ins = soup.new_tag("div")
         ins.string = tr
-        ins["style"] = "color:#0B6; margin-top:2px;"
+        ins["style"] = (
+            "color:#0B6; margin-top:4px; display:block; line-height:1.45; font-size:0.95em;"
+            "word-break:break-word; white-space:normal;"
+        )
         tag.insert_after(ins)
     # inline CSS for email client compatibility
     return inline_css(str(soup))
