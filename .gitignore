@@ -1,0 +1,48 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyd
+*.pyo
+*.egg-info/
+*.dist-info/
+
+# Virtual envs
+.venv/
+venv/
+
+# Env / secrets
+.env
+.env.*
+*.env
+config.json
+config.backup.json
+
+# Generated artifacts
+folders.txt
+folders.json
+*.log
+error.txt
+error2
+
+# Editors / OS
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Build / cache
+.pytest_cache/
+.coverage
+.coverage.*
+.cache/
+.mypy_cache/
+.pyre/
+.pytype/
+coverage.xml
+htmlcov/
+build/
+dist/
+
+# Unrelated projects (keep locally, not in this repo)
+kiss-translator/
+old-immersive-translate/

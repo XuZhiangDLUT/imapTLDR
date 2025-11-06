@@ -1,0 +1,6 @@
+imapclient
+beautifulsoup4
+premailer
+openai
+lxml
+html5lib
