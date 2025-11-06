@@ -4,9 +4,12 @@ from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 from datetime import datetime
 import pytz
+import logging
 
 from .config import load_config
 from .jobs import translate_job, summarize_job
+
+logger = logging.getLogger("mailbot")
 
 
 def start_scheduler():
@@ -18,13 +21,22 @@ def start_scheduler():
 
     # translate every N minutes
     interval_minutes = int(cfg.get('translate', {}).get('interval_minutes', 10))
-    sch.add_job(lambda: translate_job(cfg), IntervalTrigger(minutes=interval_minutes), id='translate')
+
+    def _run_translate():
+        logger.info("Scheduler tick → translate job triggered")
+        translate_job(cfg)
+
+    sch.add_job(_run_translate, IntervalTrigger(minutes=interval_minutes), id='translate')
 
     # summarize crons
-    for spec in cfg.get('summarize', {}).get('cron', ['0 7 * * *','0 12 * * *','0 19 * * *']):
-        sch.add_job(lambda: summarize_job(cfg), CronTrigger.from_crontab(spec, timezone=tz))
+    def _run_summarize():
+        logger.info("Scheduler tick → summarize job triggered")
+        summarize_job(cfg)
 
-    print('Scheduler started. Press Ctrl+C to exit.')
+    for spec in cfg.get('summarize', {}).get('cron', ['0 7 * * *','0 12 * * *','0 19 * * *']):
+        sch.add_job(_run_summarize, CronTrigger.from_crontab(spec, timezone=tz))
+
+    logger.info('Scheduler started. Press Ctrl+C to exit.')
     sch.start()
 
 

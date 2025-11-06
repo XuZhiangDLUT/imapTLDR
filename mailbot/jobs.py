@@ -3,7 +3,9 @@ from pathlib import Path
 from typing import Generator, Iterable
 from openai import OpenAI
 from bs4 import BeautifulSoup
+import logging
 
+logger = logging.getLogger("mailbot")
 from .imap_client import (
     connect,
     list_unseen,
@@ -40,7 +42,9 @@ def scan_translate_targets(c, cfg: dict, excluded_prefixes: Iterable[str]) -> Ge
 
     # normal folders
     for folder in folders:
-        uids = list_unseen(c, f"其他文件夹/{folder}" if not folder.startswith('INBOX') and not folder.startswith('其他文件夹/') else folder)
+        target_folder = folder if folder.startswith('INBOX') or folder.startswith('其他文件夹/') else f"其他文件夹/{folder}"
+        logger.info(f"Scanning folder: {target_folder}")
+        uids = list_unseen(c, target_folder)
         count = 0
         for uid in uids:
             raw = fetch_raw(c, uid)
@@ -48,7 +52,8 @@ def scan_translate_targets(c, cfg: dict, excluded_prefixes: Iterable[str]) -> Ge
             sub = decode_subject(msg)
             if not pass_prefix(sub, excluded_prefixes):
                 continue
-            yield (folder if folder.startswith('INBOX') or folder.startswith('其他文件夹/') else f"其他文件夹/{folder}", uid, msg)
+            logger.info(f"Detected subject (translate): {sub} (uid={uid})")
+            yield (target_folder, uid, msg)
             count += 1
             if count >= max_per:
                 break
@@ -57,6 +62,7 @@ def scan_translate_targets(c, cfg: dict, excluded_prefixes: Iterable[str]) -> Ge
     inbox_keywords = translate_cfg.get('inbox_keywords', ["相关研究汇总","快讯汇总"])
     inbox_froms = translate_cfg.get('inbox_from', ["scholaralerts-noreply@google.com"]) 
     uids = list_unseen(c, 'INBOX')
+    logger.info("Scanning folder: INBOX (keyword channel)")
     for uid in uids:
         raw = fetch_raw(c, uid)
         msg = parse_message(raw)
@@ -65,6 +71,7 @@ def scan_translate_targets(c, cfg: dict, excluded_prefixes: Iterable[str]) -> Ge
             continue
         sender = str(msg.get('From', ''))
         if any(k in sub for k in inbox_keywords) or any(f in sender for f in inbox_froms):
+            logger.info(f"Detected subject (translate INBOX): {sub} (from={sender}, uid={uid})")
             yield ('INBOX', uid, msg)
 
 
@@ -75,6 +82,7 @@ def new_openai(base_url: str, api_key: str, timeout: float | int = 15.0) -> Open
     if not base.endswith('/v1'):
         base += '/v1'
     # configurable timeout (default 15s)
+    logger.info(f"Initialize LLM client base={base}")
     return OpenAI(base_url=base, api_key=api_key, timeout=timeout)
 
 
@@ -91,6 +99,7 @@ def qwen_translate_batch(cli: OpenAI, model: str, segments: list[str], timeout: 
         )
         out = (r.choices[0].message.content or '').split("\n\n-----\n\n")
     except Exception as e:
+        logger.info(f"LLM translate error or timeout: {e}")
         # fallback: return empty translations to avoid blocking tests
         out = [''] * len(segments)
     if len(out) < len(segments):
@@ -109,12 +118,14 @@ def deepseek_summarize(cli: OpenAI, model: str, prompt: str, text: str, enable_t
         )
         return r.choices[0].message.content or ''
     except Exception as e:
+        logger.info(f"LLM summarize error or timeout: {e}")
         return '(summary timeout or error)'
 
 
 # --- Jobs ---
 
 def translate_job(cfg: dict):
+    logger.info("Translate job started")
     imap = cfg['imap']; pref = cfg.get('prefix', {'translate':'[机器翻译]','summarize':'[机器总结]'})
     excluded = [pref.get('translate','[机器翻译]'), pref.get('summarize','[机器总结]')]
     sf = cfg.get('llm', {}).get('siliconflow') or cfg.get('siliconflow2') or cfg.get('siliconflow')
@@ -134,16 +145,20 @@ def translate_job(cfg: dict):
     c = connect(imap['server'], imap['email'], imap['password'], port=imap.get('port',993), ssl=imap.get('ssl',True))
     try:
         for folder, uid, msg in scan_translate_targets(c, cfg, excluded):
+            sub = decode_subject(msg)
+            logger.info(f"Processing subject (translate): {sub} in {folder} (uid={uid})")
             html, text = pick_html_or_text(msg)
             if not html and text:
                 html = f"<html><body><pre>{text}</pre></body></html>"
             if not html:
+                logger.info("Skip empty body; mark seen")
                 mark_seen(c, folder, uid)
                 continue
 
             # idempotency: skip if already handled
             orig_msgid = msg.get('Message-ID') or ''
             if orig_msgid and has_linked_reply(c, folder, orig_msgid, pref.get('translate','[机器翻译]')):
+                logger.info("Skip already translated (idempotent)")
                 mark_seen(c, folder, uid)
                 continue
 
@@ -151,18 +166,21 @@ def translate_job(cfg: dict):
                 zh_html = inject_bilingual_html(html, translate_batch_mock)
             else:
                 zh_html = inject_bilingual_html(html, lambda segs: qwen_translate_batch(cli, trans_model, segs, timeout=translate_timeout))
-            new_subject = f"{pref.get('translate','[机器翻译]')} {decode_subject(msg)}"
+            new_subject = f"{pref.get('translate','[机器翻译]')} {sub}"
             out = build_email(new_subject, imap['email'], imap['email'], zh_html, None, in_reply_to=msg.get('Message-ID'))
             append_unseen(c, folder or 'INBOX', out)
             mark_seen(c, folder, uid)
+            logger.info(f"Appended translated mail: {new_subject}")
     finally:
         try:
             c.logout()
         except Exception:
             pass
+    logger.info("Translate job finished")
 
 
 def summarize_job(cfg: dict):
+    logger.info("Summarize job started")
     imap = cfg['imap']; pref = cfg.get('prefix', {'translate':'[机器翻译]','summarize':'[机器总结]'})
     excluded = [pref.get('translate','[机器翻译]'), pref.get('summarize','[机器总结]')]
 
@@ -190,6 +208,7 @@ def summarize_job(cfg: dict):
     c = connect(imap['server'], imap['email'], imap['password'], port=imap.get('port',993), ssl=imap.get('ssl',True))
     try:
         for folder in folders:
+            logger.info(f"Scanning folder (summarize): {folder}")
             uids = list_unseen(c, folder)
             pairs = []
             for uid in uids:
@@ -198,6 +217,7 @@ def summarize_job(cfg: dict):
                 sub = decode_subject(msg)
                 if not pass_prefix(sub, excluded):
                     continue
+                logger.info(f"Detected subject (summarize): {sub} (uid={uid})")
                 html, txt = pick_html_or_text(msg)
                 plain = BeautifulSoup(html, 'html5lib').get_text('\n', strip=True) if html else (txt or '')
                 if not plain:
@@ -222,6 +242,7 @@ def summarize_job(cfg: dict):
                 subject = f"{pref.get('summarize','[机器总结]')} {folder}（{len(batch)}封）"
                 out = build_email(subject, imap['email'], imap['email'], html, None)
                 append_unseen(c, folder, out)
+                logger.info(f"Appended summary: {subject}")
                 for uid, _, _ in batch:
                     mark_seen(c, folder, uid)
     finally:
@@ -229,3 +250,4 @@ def summarize_job(cfg: dict):
             c.logout()
         except Exception:
             pass
+    logger.info("Summarize job finished")

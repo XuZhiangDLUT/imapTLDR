@@ -11,6 +11,9 @@ from .imap_client import (
     append_unseen,
     mark_seen,
 )
+import logging
+
+logger = logging.getLogger("mailbot")
 
 
 def extract_segments_from_html(html: str) -> list[str]:
@@ -55,7 +58,9 @@ def translate_once(cfg: dict, max_items: int = 2):
     client = connect(imap["server"], imap["email"], imap["password"], port=imap.get("port", 993), ssl=True)
 
     try:
-        uids = search_unseen_without_prefix(client, imap.get("folder", "INBOX"), exclude_prefixes=exclude)
+        folder = imap.get("folder", "INBOX")
+        logger.info(f"Translate once: scanning folder {folder}")
+        uids = search_unseen_without_prefix(client, folder, exclude_prefixes=exclude)
         # filter out subjects with excluded prefixes client-side
         filtered_uids = []
         for uid in uids:
@@ -64,6 +69,7 @@ def translate_once(cfg: dict, max_items: int = 2):
             sub = str(msg.get("Subject", ""))
             if any(p in sub for p in exclude):
                 continue
+            logger.info(f"Detected subject (translate once): {sub} (uid={uid})")
             filtered_uids.append((uid, msg))
             if len(filtered_uids) >= max_items:
                 break
@@ -88,11 +94,13 @@ def translate_once(cfg: dict, max_items: int = 2):
         results = []
         for uid, msg in filtered_uids:
             sub = str(msg.get("Subject", ""))
+            logger.info(f"Processing subject (translate once): {sub} (uid={uid})")
             from_addr = str(msg.get("From", imap["email"]))
             to_addr = str(msg.get("To", imap["email"]))
             html, text = pick_html_or_text(msg)
             source = html or text or ""
             if not source.strip():
+                logger.info("Skip empty body; mark seen")
                 mark_seen(client, imap.get("folder", "INBOX"), uid)
                 continue
 
@@ -109,7 +117,9 @@ def translate_once(cfg: dict, max_items: int = 2):
             out = build_email(new_subject, from_addr, to_addr, body_html, body_text)
             append_unseen(client, imap.get("folder", "INBOX"), out)
             mark_seen(client, imap.get("folder", "INBOX"), uid)
+            logger.info(f"Appended translated mail: {new_subject}")
             results.append((uid, new_subject))
+        logger.info(f"Translate once finished: {len(results)} items processed")
         return results
     finally:
         try:
