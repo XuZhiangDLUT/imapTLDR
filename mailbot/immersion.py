@@ -82,11 +82,39 @@ def _is_textual_block(tag) -> bool:
     return True
 
 
+def _find_content_container(soup: BeautifulSoup):
+    # Pick ancestor of paragraph with most words, then climb up until it covers ~35% of all words
+    body = soup.body or soup
+    total_words = len((body.get_text(" ", strip=True) or "").split()) or 1
+    ps = body.find_all("p") or body.find_all("div")
+    best = None; best_words = 0
+    for p in ps:
+        txt = p.get_text(" ", strip=True)
+        wc = len(txt.split()) if txt else 0
+        if wc > best_words:
+            best, best_words = p, wc
+    if not best:
+        return [body]
+    cur = best; covered = best_words; steps = 0
+    while cur and cur is not body and steps < 10:
+        parent = cur.parent
+        if not parent or not getattr(parent, 'get_text', None):
+            break
+        covered = len((parent.get_text(" ", strip=True) or "").split()) or covered
+        if covered/total_words >= 0.35:
+            cur = parent; break
+        cur = parent; steps += 1
+    return [cur or body]
+
+
 def inject_bilingual_html(html: str, translate_batch):
     # inline css first to preserve styles across mail clients
     soup = BeautifulSoup(inline_css(html), "html5lib")
-    # collect only textual blocks
-    blocks = [b for b in soup.select(BLOCK_SEL) if _is_textual_block(b)]
+    # collect textual blocks within detected main container(s)
+    roots = _find_content_container(soup)
+    blocks = []
+    for root in roots:
+        blocks.extend([b for b in root.select(BLOCK_SEL) if _is_textual_block(b)])
     segs: list[str] = []
     for b in blocks:
         txt = "\n".join(n for n in b.get_text("\n", strip=True).splitlines() if n)
