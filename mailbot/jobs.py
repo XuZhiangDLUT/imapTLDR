@@ -7,6 +7,7 @@ import logging
 from datetime import datetime
 import json
 from pathlib import Path as _Path
+from premailer import transform as inline_css
 
 logger = logging.getLogger("mailbot")
 
@@ -30,6 +31,51 @@ def _save_summary_payload(entries: list[dict]):
         logger.info(f"Saved summarize payloads -> {path}")
     except Exception as e:
         logger.info(f"Failed to save summarize payloads: {e}")
+
+
+def _render_summary_html(items: list[tuple[object, str]], folder: str) -> str:
+    # items: list of (message, summary_text)
+    now = datetime.now().strftime('%Y-%m-%d %H:%M')
+    def _bullets(text: str) -> str:
+        lines = [l.strip() for l in (text or '').splitlines()]
+        lis = []
+        for l in lines:
+            if not l:
+                continue
+            if l.startswith(('- ', '• ', '* ')):
+                l = l[2:].strip()
+            lis.append(f"<li>{l}</li>")
+        return "<ul style=\"margin:0; padding-left:18px;\">" + "".join(lis) + "</ul>"
+
+    cards = []
+    for m, summ in items:
+        subj = decode_subject(m)
+        body = _bullets(summ) if summ else "<div style=\"color:#888;\">(empty)</div>"
+        cards.append(
+            f"""
+            <li style=\"margin-bottom:14px;\">
+              <div style=\"font-weight:600; margin-bottom:6px;\">{subj}</div>
+              {body}
+            </li>
+            """
+        )
+
+    html = f"""
+    <html>
+      <body>
+        <div style=\"max-width:760px;margin:0 auto;font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Helvetica,Arial,sans-serif;color:#1f2937;\">
+          <div style=\"background:#f3f4f6;border:1px solid #e5e7eb;border-radius:8px;padding:12px 16px;margin:12px 0;\">
+            <div style=\"font-size:16px;font-weight:600;\">机器总结 · {folder}</div>
+            <div style=\"font-size:12px;color:#6b7280;\">生成时间：{now}</div>
+          </div>
+          <ol style=\"margin:0;padding-left:20px;\">{''.join(cards)}</ol>
+          <div style=\"margin-top:12px;font-size:12px;color:#9ca3af;\">自动生成 · 如有误请忽略</div>
+        </div>
+      </body>
+    </html>
+    """
+    return inline_css(html)
+
 from .imap_client import (
     connect,
     list_unseen,
@@ -277,9 +323,7 @@ def summarize_job(cfg: dict):
                 batch = pairs[i:i+batch_size]
                 if not batch:
                     continue
-                html = "<html><body><ol>" + "".join(
-                    f"<li><b>{decode_subject(m)}</b><br/>{summ}</li>" for _, m, summ in batch
-                ) + "</ol></body></html>"
+                html = _render_summary_html([(m, summ) for _, m, summ in batch], folder)
                 subject = f"{pref.get('summarize','[机器总结]')} {folder}（{len(batch)}封）"
                 out = build_email(subject, imap['email'], imap['email'], html, None)
                 append_unseen(c, folder, out)
