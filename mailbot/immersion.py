@@ -3,15 +3,17 @@ from bs4 import BeautifulSoup
 from premailer import transform as inline_css
 
 # Safer immersive injection: only target text blocks; avoid duplicating large containers
-BLOCK_SEL = "p, li, h1, h2, h3, h4, h5, h6"
+# Extremely conservative: only p/li to avoid headline/hero injection
+BLOCK_SEL = "p, li"
 
 
 def _has_ancestor_with_keywords(tag, keywords: tuple[str, ...]) -> bool:
     cur = tag
     depth = 0
-    while cur and depth < 6:
+    while cur and depth < 20:
         attrs = (" ".join(cur.get("class", [])).lower() + " " + str(cur.get("id", "")).lower()).strip()
-        if any(k in attrs for k in keywords):
+        role = (cur.get("role") or "").lower()
+        if any(k in attrs for k in keywords) or role in ("banner", "navigation", "contentinfo"):
             return True
         cur = cur.parent
         depth += 1
@@ -22,7 +24,7 @@ def _ancestor_has_colored_bg(tag) -> bool:
     # Heuristic: banner/hero regions often have non-white backgrounds
     cur = tag.parent
     depth = 0
-    while cur is not None and depth < 6:
+    while cur is not None and depth < 20:
         # bgcolor attribute
         bgc = (cur.get('bgcolor') or '').strip().lower()
         if bgc and bgc not in ('#fff', '#ffffff', 'white', 'transparent', 'none'):
@@ -64,6 +66,11 @@ def _is_textual_block(tag) -> bool:
     if _ancestor_has_colored_bg(tag):
         return False
     style = (tag.get("style", "") or "").lower()
+    # if tag itself has non-white/transparent background or white text, skip
+    if ('background' in style or 'background-color' in style) and not any(x in style for x in ('white', '#fff', '#ffffff', 'transparent')):
+        return False
+    if 'color:' in style and any(x in style for x in ('#fff', '#ffffff', 'white', 'rgb(255,255,255)', 'rgb(255, 255, 255)')):
+        return False
     if any(k in style for k in ("position:absolute", "position:fixed", "float:")):
         return False
     text = tag.get_text(" ", strip=True)
