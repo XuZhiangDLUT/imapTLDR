@@ -89,21 +89,61 @@ def ensure_folder(client: IMAPClient, folder: str) -> str:
         return 'INBOX'
 
 
+import logging
+
+logger = logging.getLogger("mailbot")
+
 def append_unseen(client: IMAPClient, folder: str, msg: EmailMessage):
     folder = ensure_folder(client, folder)
     # Append without \Seen flag
     mid = str(msg.get('Message-ID', '') or '')
+    subj = str(msg.get('Subject', '') or '')
     client.append(folder, msg.as_bytes(), flags=())
-    # Enforce UNSEEN for the newly appended message (best-effort)
+    # Enforce UNSEEN for the newly appended message (best-effort, with multiple fallbacks)
     try:
+        client.select_folder(folder)
+        candidates: list[int] = []
         if mid:
-            client.select_folder(folder)
-            uids = client.search(['HEADER', 'Message-ID', mid])
-            if uids:
-                client.remove_flags(uids, [b'\\Seen'])
-    except Exception:
-        # ignore enforcement errors
-        pass
+            mids = [mid, mid.strip('<>')]
+            for m in mids:
+                try:
+                    u = client.search(['HEADER', 'Message-ID', m])
+                    if u:
+                        candidates.extend(u)
+                except Exception:
+                    pass
+        if not candidates and subj:
+            # Prefer auto-generated header to narrow down
+            try:
+                auto = client.search(['HEADER', 'Auto-Submitted', 'auto-generated'])
+            except Exception:
+                auto = []
+            pool = auto[-50:] if len(auto) > 50 else auto
+            if pool:
+                data = client.fetch(pool, [b'BODY.PEEK[HEADER]'])
+                for uid in pool:
+                    try:
+                        hdr = BytesParser(policy=policy.default).parsebytes(data[uid][b'BODY[HEADER]'])
+                        if str(hdr.get('Subject','') or '') == subj:
+                            candidates.append(uid)
+                    except Exception:
+                        continue
+            # Fallback to SUBJECT search if still not found
+            if not candidates:
+                try:
+                    by_sub = client.search(['SUBJECT', subj])
+                    if by_sub:
+                        candidates.extend(by_sub[-1:])  # last one most likely the appended
+                except Exception:
+                    pass
+        if candidates:
+            client.remove_flags(candidates, [b'\\Seen'])
+            logger.info(f"Enforce UNSEEN on appended mail: folder={folder}, uids={candidates}")
+        else:
+            logger.info(f"Could not locate appended mail for UNSEEN enforcement: folder={folder}, subject={subj}")
+    except Exception as e:
+        # ignore enforcement errors, log for diagnosis
+        logger.info(f"UNSEEN enforcement skipped due to error: {e}")
 
 
 def mark_seen(client: IMAPClient, folder: str, uid: int):
