@@ -91,12 +91,29 @@ def ensure_folder(client: IMAPClient, folder: str) -> str:
 
 def append_unseen(client: IMAPClient, folder: str, msg: EmailMessage):
     folder = ensure_folder(client, folder)
+    # Append without \Seen flag
+    mid = str(msg.get('Message-ID', '') or '')
     client.append(folder, msg.as_bytes(), flags=())
+    # Enforce UNSEEN for the newly appended message (best-effort)
+    try:
+        if mid:
+            client.select_folder(folder)
+            uids = client.search(['HEADER', 'Message-ID', mid])
+            if uids:
+                client.remove_flags(uids, [b'\\Seen'])
+    except Exception:
+        # ignore enforcement errors
+        pass
 
 
 def mark_seen(client: IMAPClient, folder: str, uid: int):
     client.select_folder(folder)
     client.add_flags([uid], [b"\\Seen"])  # make original read
+
+
+def mark_unseen(client: IMAPClient, folder: str, uid: int):
+    client.select_folder(folder)
+    client.remove_flags([uid], [b"\\Seen"])  # ensure unread
 
 
 def list_unseen(client: IMAPClient, folder: str) -> list[int]:
