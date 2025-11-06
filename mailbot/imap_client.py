@@ -227,34 +227,76 @@ def has_linked_reply(client: IMAPClient, folder: str, orig_msgid: str, prefix: s
 
 
 def list_unseen_robust(client: IMAPClient, folder: str, exclude_auto_generated: bool = True, fetch_chunk: int = 500) -> list[int]:
-    """Robust UNSEEN enumeration by fetching FLAGS over ALL UIDs in chunks.
-    Works around server SEARCH limits by client-side filtering.
+    """Robust UNSEEN enumeration that avoids SEARCH result truncation.
+
+    Strategy:
+    - Use UID ranges derived from UIDNEXT to iterate across the entire mailbox.
+    - Fetch FLAGS in chunks and filter client-side for UNSEEN.
+    - Optionally filter out auto-generated messages by inspecting headers.
     """
     client.select_folder(folder)
+
+    # Determine UID upper bound without relying on SEARCH
+    max_uid: int | None = None
     try:
-        all_uids = client.search(['ALL'])
+        status = client.folder_status(folder, [b'UIDNEXT'])  # type: ignore[arg-type]
+        if isinstance(status, dict):
+            nxt = status.get(b'UIDNEXT') or status.get('UIDNEXT')
+            if isinstance(nxt, int):
+                # UIDNEXT is the next UID to be assigned, so max UID is UIDNEXT-1
+                max_uid = max(0, nxt - 1)
     except Exception:
-        return []
-    if not all_uids:
-        return []
+        max_uid = None
+
     unseen: list[int] = []
     step = max(1, int(fetch_chunk))
-    for i in range(0, len(all_uids), step):
-        chunk = all_uids[i:i+step]
-        try:
-            data = client.fetch(chunk, [b'FLAGS'])
-        except Exception:
-            continue
-        for uid in chunk:
+
+    if max_uid and max_uid > 0:
+        # Walk through the full UID space using UID range FETCH
+        start = 1
+        while start <= max_uid:
+            end = min(start + step - 1, max_uid)
+            uid_range = f"{start}:{end}"
             try:
-                flags = data[uid][b'FLAGS']
-                if b'\\Seen' not in flags:
-                    unseen.append(uid)
+                data = client.fetch(uid_range, [b'FLAGS'])
             except Exception:
-                unseen.append(uid)
+                # If range fetch fails (server quirk), try to fall back to SEARCH for this window
+                try:
+                    # Attempt a bounded SEARCH using SINCE/BEFORE isn't reliable without dates; skip to next window
+                    data = None
+                except Exception:
+                    data = None
+            if isinstance(data, dict) and data:
+                for uid, info in data.items():
+                    try:
+                        flags = info.get(b'FLAGS') or info.get('FLAGS') or ()
+                        if b'\\Seen' not in flags:
+                            unseen.append(int(uid))
+                    except Exception:
+                        unseen.append(int(uid))
+            start = end + 1
+    else:
+        # Fallback: rely on SEARCH ALL (older servers) and chunk-FETCH FLAGS
+        try:
+            all_uids = client.search(['ALL'])
+        except Exception:
+            all_uids = []
+        for i in range(0, len(all_uids), step):
+            chunk = all_uids[i:i+step]
+            try:
+                data = client.fetch(chunk, [b'FLAGS'])
+            except Exception:
+                continue
+            for uid in chunk:
+                try:
+                    flags = data[uid][b'FLAGS']
+                    if b'\\Seen' not in flags:
+                        unseen.append(uid)
+                except Exception:
+                    unseen.append(uid)
+
     if exclude_auto_generated and unseen:
         kept: list[int] = []
-        step = max(1, int(fetch_chunk))
         for i in range(0, len(unseen), step):
             chunk = unseen[i:i+step]
             try:

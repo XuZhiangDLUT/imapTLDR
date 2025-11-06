@@ -321,7 +321,10 @@ def summarize_job(cfg: dict):
                     ])
                     pairs.append((uid, msg, cards_html))
                 else:
-                    pairs.append((uid, msg, '\n\n'.join(answers_texts)))
+                    _txt = ('\n\n'.join(answers_texts)).strip()
+                    if not _txt:
+                        _txt = "<div style=\"color:#888;\">没有相关内容</div>"
+                    pairs.append((uid, msg, _txt))
 
             for i in range(0, len(pairs), batch_size):
                 batch = pairs[i:i+batch_size]
@@ -348,4 +351,3 @@ def summarize_job(cfg: dict):
     _meta['end_time'] = datetime.now().isoformat(timespec='seconds')
     _save_summary_payload(submitted_entries, path=_run_path, meta=_meta)
     logger.info("Summarize job finished")
-

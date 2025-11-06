@@ -135,8 +135,11 @@ def summarize_once(cfg: dict, folder: str | None = None, batch: int = 5):
                     rel = (a.get('relevance') or '').strip()
                     lis = ''.join(f"<li>{b}</li>" for b in bullets[:3])
                     card = f"<div style=\"border:1px solid #e5e7eb;border-radius:10px;padding:10px 12px;margin:10px 0;\"><div style=\"font-weight:700;font-size:15px;line-height:1.35;margin-bottom:6px;\"><span style=\"color:#111827;\">中文标题：</span><span style=\"color:#111827;\">{tzh}</span></div><div style=\"font-size:12px;color:#374151;margin-bottom:4px;\">English Title: {ten}</div><div style=\"font-size:12px;color:#6b7280;margin-bottom:6px;\">Authors: {authors}</div><div><div style=\"font-weight:600;color:#111827;margin-bottom:4px;\">要点</div><ul style=\"margin:0;padding-left:18px;\">{lis}</ul><div style=\"font-size:12px;color:#059669;margin-top:6px;\">相关性：{rel}</div></div></div>"
-                    cards.append(card)
-                items.append((msg, ''.join(cards)))
+                cards.append(card)
+                rendered = ''.join(cards)
+                if not rendered:
+                    rendered = "<div style=\"color:#888;\">没有相关内容</div>"
+                items.append((msg, rendered))
             else:
                 items.append((msg, summ))
             # checkpoint after each item
