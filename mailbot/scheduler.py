@@ -18,22 +18,29 @@ logger = logging.getLogger("mailbot")
 
 def _setup_logging():
     """Apply a clean, consistent log format for all modules."""
+    fmt = logging.Formatter(
+        fmt="%(asctime)s | mailbot | %(levelname)s | %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
     root = logging.getLogger()
-    if not root.handlers:
-        logging.basicConfig(
-            level=logging.INFO,
-            format="%(asctime)s | mailbot | %(levelname)s | %(message)s",
-            datefmt="%Y-%m-%d %H:%M:%S",
-        )
-    else:
-        for h in root.handlers:
-            try:
-                h.setFormatter(logging.Formatter(
-                    fmt="%(asctime)s | mailbot | %(levelname)s | %(message)s",
-                    datefmt="%Y-%m-%d %H:%M:%S",
-                ))
-            except Exception:
-                pass
+    # Force a single uniform StreamHandler on root
+    for h in list(root.handlers or []):
+        try:
+            root.removeHandler(h)
+        except Exception:
+            pass
+    sh = logging.StreamHandler()
+    sh.setFormatter(fmt)
+    root.addHandler(sh)
+    root.setLevel(logging.INFO)
+
+    # Ensure apscheduler loggers propagate to root and don't override format
+    for name in list(logging.root.manager.loggerDict.keys()):
+        if str(name).startswith("apscheduler"):
+            l = logging.getLogger(name)
+            l.handlers = []
+            l.setLevel(logging.INFO)
+            l.propagate = True
 
 
 def start_scheduler():
