@@ -42,8 +42,22 @@ def _setup_logging():
         l.propagate = True
         if str(name).startswith("apscheduler"):
             l.setLevel(logging.WARNING)  # silence APScheduler info-level noise
+        elif str(name).startswith("httpx") or str(name).startswith("httpcore"):
+            l.setLevel(logging.WARNING)  # silence HTTP request info lines
+        elif str(name).startswith("openai") or str(name).startswith("urllib3") or str(name).startswith("requests"):
+            l.setLevel(logging.WARNING)
         else:
             l.setLevel(logging.INFO)
+
+    # Also proactively register common noisy loggers
+    for name in ("apscheduler", "apscheduler.scheduler", "apscheduler.executors", "httpx", "httpcore", "openai", "urllib3", "requests"):
+        l = logging.getLogger(name)
+        l.handlers = []
+        l.propagate = True
+        if name.startswith("apscheduler"):
+            l.setLevel(logging.WARNING)
+        else:
+            l.setLevel(logging.WARNING)
 
     # Helper for safe ASCII symbols in non-UTF8 terminals
     enc = (getattr(sys.stdout, 'encoding', None) or '').lower()
