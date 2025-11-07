@@ -138,6 +138,13 @@ def start_scheduler():
         jid = f"summarize:{spec}"
         sch.add_job(_run_summarize, CronTrigger.from_crontab(spec, timezone=tz), id=jid, misfire_grace_time=3600)
 
+    # Warm-up: run summarize once immediately at startup (higher priority)
+    try:
+        logger.info(f"{SYM_START} warm-up summarize once now")
+        _run_summarize()
+    except Exception as e:
+        logger.exception(f"warm-up summarize error: {e}")
+
     # Translate is scheduled as a one-shot; after each finish it re-schedules itself
     _schedule_translate_next(timedelta(seconds=1))
 
