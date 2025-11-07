@@ -714,7 +714,7 @@ def translate_html_inplace(html: str, translate_batch):
                     cls.add(NOTRANSLATE_CLASS)
                     span['class'] = list(cls)
                     # vivid color, keep other typography unchanged
-                    span['style'] = 'color:#ff1744;font:inherit;line-height:inherit;'
+                    span['style'] = 'color:#16a34a;font:inherit;line-height:inherit;'
                     span.string = slot['tr']
                     pieces.append(span)
                     if slot['tail']:
