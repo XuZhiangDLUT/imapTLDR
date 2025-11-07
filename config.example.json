@@ -46,10 +46,10 @@
                 "enable_thinking":  true,
                 "thinking_budget":  4096,
                 "prompt_file":  "Prompt.txt",
-                "request_timeout_seconds":  15,
+                "request_timeout_seconds":  300,
                 "summarize_timeout_seconds":  15,
                 "translator_model":  "Qwen/Qwen2.5-7B-Instruct",
-                "translate_timeout_seconds":  15
+                "translate_timeout_seconds":  300
             },
     "translate":  {
                       "interval_minutes":  10,
@@ -82,6 +82,9 @@
                                      ],
                       "max_per_run_per_folder":  3,
                       "strict_line":  true,
-                      "inplace_replace":  true
+                      "inplace_replace":  true,
+                      "concurrency":  6,
+                      "rpm_limit":  1000,
+                      "tpm_limit":  50000
                   }
 }

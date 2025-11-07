@@ -502,18 +502,71 @@ def translate_job(cfg: dict):
             inplace = bool(tcfg.get('inplace_replace', False))
             strict_line = bool(tcfg.get('strict_line', True))
 
-            # Build a translator wrapper that calls the model per-segment to ensure alignment
+            # Build a translator wrapper that calls the model per-segment with bounded concurrency
             if use_mock:
                 def translator(batch: list[str]) -> list[str]:
                     return translate_batch_mock(batch)
             else:
+                # Concurrency and rate limits
+                rpm_limit = int(tcfg.get('rpm_limit', 1000))
+                tpm_limit = int(tcfg.get('tpm_limit', 50000))
+                max_workers = int(tcfg.get('concurrency', 6))
+
+                import time as _t
+                import threading as _th
+                from concurrent.futures import ThreadPoolExecutor, as_completed
+
+                class TokenBucket:
+                    def __init__(self, capacity: float, refill_per_sec: float):
+                        self.capacity = float(max(1.0, capacity))
+                        self.refill = float(max(0.01, refill_per_sec))
+                        self.tokens = float(capacity)
+                        self.ts = _t.monotonic()
+                        self.lock = _th.Lock()
+
+                    def acquire(self, amount: float):
+                        amount = float(max(0.0, amount))
+                        while True:
+                            with self.lock:
+                                now = _t.monotonic()
+                                elapsed = now - self.ts
+                                if elapsed > 0:
+                                    self.tokens = min(self.capacity, self.tokens + elapsed * self.refill)
+                                    self.ts = now
+                                if self.tokens >= amount:
+                                    self.tokens -= amount
+                                    return
+                                need = (amount - self.tokens) / self.refill
+                            _t.sleep(min(0.25, max(need, 0.02)))
+
+                req_bucket = TokenBucket(capacity=float(rpm_limit), refill_per_sec=float(rpm_limit)/60.0)
+                tok_bucket = TokenBucket(capacity=float(tpm_limit), refill_per_sec=float(tpm_limit)/60.0)
+
+                def do_one(idx: int, seg: str) -> tuple[int, str]:
+                    # estimate tokens (rough) for limit accounting
+                    try:
+                        est_tokens = max(1, int(rough_token_count(seg) + 64))
+                    except Exception:
+                        est_tokens = 128
+                    # acquire rate limits
+                    req_bucket.acquire(1.0)
+                    tok_bucket.acquire(float(est_tokens))
+                    out = qwen_translate_single(cli, trans_model, seg, timeout=translate_timeout)
+                    return idx, out
+
                 def translator(batch: list[str]) -> list[str]:
-                    outs: list[str] = []
-                    import time as _t
-                    for seg in batch:
-                        outs.append(qwen_translate_single(cli, trans_model, seg, timeout=translate_timeout))
-                        # throttle ~< 1000 RPM
-                        _t.sleep(0.07)
+                    if not batch:
+                        return []
+                    outs = [''] * len(batch)
+                    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+                        futures = [ex.submit(do_one, i, x) for i, x in enumerate(batch)]
+                        for fut in as_completed(futures):
+                            try:
+                                i, res = fut.result()
+                                outs[i] = (res or '').strip()
+                            except Exception as e:
+                                # fill empty on failure for this segment
+                                logger.info(f"translate future failed: {e}")
                     return outs
 
             if inplace:
