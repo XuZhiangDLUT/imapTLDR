@@ -113,8 +113,29 @@ def start_scheduler():
 
     # Startup banner + next runs
     logger.info("⏳ scheduler starting...")
+
+    def _safe_next_time(job):
+        try:
+            nrt = getattr(job, 'next_run_time', None)
+            if nrt is None:
+                trig = getattr(job, 'trigger', None)
+                if trig is not None:
+                    try:
+                        now = datetime.now(tz)
+                        nrt = trig.get_next_fire_time(None, now)
+                    except Exception:
+                        nrt = None
+            if nrt and hasattr(nrt, 'astimezone'):
+                try:
+                    return nrt.astimezone(tz)
+                except Exception:
+                    return nrt
+            return nrt
+        except Exception:
+            return None
+
     for j in sch.get_jobs():
-        when = j.next_run_time.astimezone(tz) if j.next_run_time else None
+        when = _safe_next_time(j)
         when_s = when.strftime("%Y-%m-%d %H:%M:%S %Z") if when else "N/A"
         logger.info(f"⏰ next at {when_s} → {j.id}")
 
