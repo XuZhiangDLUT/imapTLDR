@@ -81,6 +81,7 @@
                                          "scholaralerts-noreply@google.com"
                                      ],
                       "max_per_run_per_folder":  3,
-                      "strict_line":  true
+                      "strict_line":  true,
+                      "inplace_replace":  true
                   }
 }

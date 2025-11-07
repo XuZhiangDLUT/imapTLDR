@@ -602,3 +602,107 @@ def inject_bilingual_html_linewise(html: str, translate_batch):
             continue
 
     return str(soup)
+
+
+# In-place: translate text nodes only, keep DOM unchanged
+def translate_html_inplace(html: str, translate_batch):
+    """
+    Translate visible text nodes in place without adding any new elements.
+    - Skips script/style/noscript/textarea/svg/form/button and <code>/<pre>
+    - Splits each text node by newlines (keeps delimiters) and translates
+      only parts that look like English
+    - Preserves surrounding whitespace and newlines exactly
+    """
+    soup = BeautifulSoup(inline_css(html), 'html5lib')
+
+    # Build translation requests by scanning text nodes
+    requests = []  # list[str]
+    slots = []     # list of (text_node, token_index, leading, trailing)
+
+    SKIP_PARENTS = set(['script','style','svg','form','button','noscript','textarea','code','pre'])
+
+    for node in soup.descendants:
+        if not isinstance(node, NavigableString):
+            continue
+        raw = str(node)
+        if not raw or not raw.strip():
+            continue
+        # skip certain parents
+        par = getattr(node, 'parent', None)
+        pname = (getattr(par, 'name', None) or '').lower()
+        if pname in SKIP_PARENTS:
+            continue
+        # avoid re-processing cloned/injected areas (not used in-place, but safe)
+        try:
+            if par and (par.get(MARK_ATTR) == 'copiedNode' or par.find_parent(attrs={MARK_ATTR:'copiedNode'})):
+                continue
+        except Exception:
+            pass
+
+        # tokenize by newline while keeping delimiters
+        tokens = []
+        i = 0
+        import re as _re
+        for part in _re.split(r'(\r?\n)', raw):
+            tokens.append(part)
+        # collect translatable parts (even indexes that are not newline tokens)
+        for idx, tok in enumerate(tokens):
+            if idx % 2 == 1 and tok in ('\n','\r\n'):
+                continue
+            if tok in ('\n','\r\n'):
+                continue
+            if not tok or not tok.strip():
+                continue
+            # strip but remember leading/trailing spaces
+            m = _re.match(r'^(\s*)(.*?)(\s*)$', tok, _re.S)
+            lead = m.group(1)
+            core = m.group(2)
+            tail = m.group(3)
+            if not _is_probably_english_text(core):
+                continue
+            requests.append(core)
+            slots.append((node, idx, lead, tail))
+
+    if not requests:
+        return str(soup)
+
+    # Translate in chunks
+    results = []
+    CHUNK = 60
+    for i in range(0, len(requests), CHUNK):
+        part = translate_batch(requests[i:i+CHUNK])
+        if not part:
+            part = [''] * len(requests[i:i+CHUNK])
+        results.extend(part)
+
+    # Apply back to nodes
+    # Build a mapping from text node to its token list to reconstruct once
+    from collections import defaultdict
+    token_map = defaultdict(list)  # node -> list of tokens
+    filled = defaultdict(int)      # node -> number of replacements filled so far
+    # Pre-split all nodes once
+    import re as _re2
+    for node in {n for (n, _, _, _) in slots}:
+        token_map[node] = _re2.split(r'(\r?\n)', str(node))
+
+    rpos = 0
+    for (node, token_index, lead, tail) in slots:
+        if rpos >= len(results):
+            break
+        tr = results[rpos] or ''
+        rpos += 1
+        # Rebuild this token with preserved whitespace
+        cur = token_map[node][token_index]
+        if cur in ('\n','\r\n'):
+            continue
+        # replace only the core, keep leading/trailing spaces
+        token_map[node][token_index] = f"{lead}{tr}{tail}"
+
+    # Write back to DOM
+    for node, tokens in token_map.items():
+        try:
+            node.replace_with(''.join(tokens))
+        except Exception:
+            continue
+
+    return str(soup)

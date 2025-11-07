@@ -138,6 +138,7 @@ from .immersion import (
     inject_bilingual_html,
     inject_bilingual_html_conservative,
     inject_bilingual_html_linewise,
+    translate_html_inplace,
 )
 
 
@@ -468,8 +469,15 @@ def translate_job(cfg: dict):
                 mark_seen(c, folder, uid)
                 continue
 
-            strict_line = bool(cfg.get('translate', {}).get('strict_line', True))
-            if strict_line:
+            tcfg = cfg.get('translate', {})
+            inplace = bool(tcfg.get('inplace_replace', False))
+            strict_line = bool(tcfg.get('strict_line', True))
+            if inplace:
+                if use_mock:
+                    zh_html = translate_html_inplace(html, translate_batch_mock)
+                else:
+                    zh_html = translate_html_inplace(html, lambda segs: qwen_translate_batch(cli, trans_model, segs, timeout=translate_timeout))
+            elif strict_line:
                 if use_mock:
                     zh_html = inject_bilingual_html_linewise(html, translate_batch_mock)
                 else:
