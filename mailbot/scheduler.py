@@ -97,31 +97,31 @@ def start_scheduler():
     def _run_summarize():
         with RUN_LOCK:
             t0 = datetime.now(tz)
-            logger.info(f"{SYM_START} summarize start")
+            logger.info("START summarize start")
             try:
                 summarize_job(cfg)
             except Exception as e:
                 logger.exception(f"summarize error: {e}")
             finally:
                 dt = int((datetime.now(tz) - t0).total_seconds())
-                logger.info(f"{SYM_DONE} summarize end | duration={dt}s")
+                logger.info(f"DONE summarize end | duration={dt}s")
 
     def _schedule_translate_next(delay: timedelta):
         run_at = datetime.now(tz) + delay
         sch.add_job(_run_translate, DateTrigger(run_date=run_at), id="translate", replace_existing=True)
-        logger.info(f"{SYM_NEXT} next translate at {run_at.strftime('%Y-%m-%d %H:%M:%S %Z')}")
+        logger.info(f"NEXT next translate at {run_at.strftime('%Y-%m-%d %H:%M:%S %Z')}")
 
     def _run_translate():
         with RUN_LOCK:
             t0 = datetime.now(tz)
-            logger.info(f"{SYM_START} translate start")
+            logger.info("START translate start")
             try:
                 translate_job(cfg)
             except Exception as e:
                 logger.exception(f"translate error: {e}")
             finally:
                 dt = int((datetime.now(tz) - t0).total_seconds())
-                logger.info(f"{SYM_DONE} translate end | duration={dt}s")
+                logger.info(f"DONE translate end | duration={dt}s")
 
         # schedule next translate from finish time
         _schedule_translate_next(translate_delay)
@@ -130,7 +130,7 @@ def start_scheduler():
         if summarize_pending.get("flag"):
             summarize_pending["flag"] = False
             sch.add_job(_run_summarize, DateTrigger(run_date=datetime.now(tz) + timedelta(seconds=1)), id="summarize-catchup", replace_existing=True)
-            logger.info(f"{SYM_FLAG} summarize pending → scheduled immediate catch-up")
+            logger.info("FLAG summarize pending -> scheduled immediate catch-up")
 
     # Summarize jobs (strict on-the-hour cron). If missed, run ASAP afterwards
     summarize_specs = cfg.get("summarize", {}).get("cron", ["0 7 * * *", "0 12 * * *", "0 19 * * *"])
@@ -140,7 +140,7 @@ def start_scheduler():
 
     # Warm-up: run summarize once immediately at startup (higher priority)
     try:
-        logger.info(f"{SYM_START} warm-up summarize once now")
+        logger.info("START warm-up summarize once now")
         _run_summarize()
     except Exception as e:
         logger.exception(f"warm-up summarize error: {e}")
@@ -154,14 +154,14 @@ def start_scheduler():
             if event.code == EVENT_JOB_MISSED and isinstance(getattr(event, "job_id", ""), str):
                 if str(event.job_id).startswith("summarize"):
                     summarize_pending["flag"] = True
-                    logger.info(f"{SYM_WARN} summarize misfired → will run right after translate finishes")
+                    logger.info("WARN summarize misfired -> will run right after translate finishes")
         except Exception:
             pass
 
     sch.add_listener(_listener, EVENT_JOB_MISSED)
 
     # Startup banner + next runs
-    logger.info(f"{SYM_START} scheduler starting...")
+    logger.info("START scheduler starting...")
 
     def _safe_next_time(job):
         try:
@@ -186,7 +186,7 @@ def start_scheduler():
     for j in sch.get_jobs():
         when = _safe_next_time(j)
         when_s = when.strftime("%Y-%m-%d %H:%M:%S %Z") if when else "N/A"
-        logger.info(f"{SYM_NEXT} next at {when_s} → {j.id}")
+        logger.info(f"NEXT next at {when_s} -> {j.id}")
 
     sch.start()
 
