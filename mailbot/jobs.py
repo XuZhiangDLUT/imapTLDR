@@ -130,9 +130,15 @@ from .imap_client import (
     build_email,
     append_unseen,
     mark_seen,
+    has_linked_reply,
 )
 from .utils import decode_subject, pass_prefix, split_by_chars, rough_token_count
-from .mock_llm import summarize_mock
+from .mock_llm import summarize_mock, translate_batch_mock
+from .immersion import (
+    inject_bilingual_html,
+    inject_bilingual_html_conservative,
+    inject_bilingual_html_linewise,
+)
 
 
 DEFAULT_SUMMARY_FOLDERS = [
@@ -351,3 +357,146 @@ def summarize_job(cfg: dict):
     _meta['end_time'] = datetime.now().isoformat(timespec='seconds')
     _save_summary_payload(submitted_entries, path=_run_path, meta=_meta)
     logger.info("Summarize job finished")
+
+
+# --- Translation (ported minimal from imapTLDR2) ---
+
+# Fallback folders when config.translate.folders not set
+DEFAULT_TRANSLATE_FOLDERS = [
+    "IJSS","TWS","JMPS","EML","PRL","IJMS","IJNME","CMAME","ComputerStruct","SMO",
+    "ES","NLDyna","JSV","IJIE","OceanEng","Def. Technol.","Eur.J.Mech.","CompositeStruct",
+]
+
+def qwen_translate_batch(cli: OpenAI, model: str, segments: list[str], timeout: float | int = 15.0) -> list[str]:
+    if not segments:
+        return []
+    sys = "严格逐段翻译为中文。保持数字、专有名词与标点。不要添加解释。"
+    user = "\n\n-----\n\n".join(segments)
+    try:
+        r = cli.chat.completions.create(
+            model=model, temperature=0.2,
+            messages=[{"role":"system","content":sys},{"role":"user","content":user}],
+            timeout=timeout,
+        )
+        out = (r.choices[0].message.content or '').split("\n\n-----\n\n")
+    except Exception as e:
+        logger.info(f"LLM translate error or timeout: {e}")
+        out = [''] * len(segments)
+    if len(out) < len(segments):
+        out += ['']*(len(segments)-len(out))
+    return [s.strip() for s in out][:len(segments)]
+
+def scan_translate_targets(c, cfg: dict, excluded_prefixes: Iterable[str]):
+    translate_cfg = cfg.get('translate', {})
+    folders = translate_cfg.get('folders', DEFAULT_TRANSLATE_FOLDERS)
+    max_per = int(translate_cfg.get('max_per_run_per_folder', 3))
+
+    # normal folders
+    for folder in folders:
+        # QQ 邮箱其他文件夹通常以“其他文件夹/xxx”，保持与 summarize 同一前缀
+        target_folder = folder if (folder.startswith('INBOX') or '/' in folder) else f"其他文件夹/{folder}"
+        try:
+            logger.info(f"Scanning folder: {target_folder}")
+            uids = list_unseen(c, target_folder)
+        except Exception as e:
+            logger.info(f"Skip folder (not exist): {target_folder} ({e})")
+            continue
+        count = 0
+        for uid in uids:
+            raw = fetch_raw(c, uid)
+            msg = parse_message(raw)
+            sub = decode_subject(msg)
+            if not pass_prefix(sub, excluded_prefixes):
+                continue
+            logger.info(f"Detected subject (translate): {sub} (uid={uid})")
+            yield (target_folder, uid, msg)
+            count += 1
+            if count >= max_per:
+                break
+
+    # INBOX keyword channel
+    inbox_keywords = translate_cfg.get('inbox_keywords', ["相关研究汇总","快讯汇总"])  # defaults
+    inbox_froms = translate_cfg.get('inbox_from', ["scholaralerts-noreply@google.com"]) 
+    uids = list_unseen(c, 'INBOX')
+    logger.info("Scanning folder: INBOX (keyword channel)")
+    for uid in uids:
+        raw = fetch_raw(c, uid)
+        msg = parse_message(raw)
+        sub = decode_subject(msg)
+        if not pass_prefix(sub, excluded_prefixes):
+            continue
+        sender = str(msg.get('From', ''))
+        if any(k in sub for k in inbox_keywords) or any(f in sender for f in inbox_froms):
+            logger.info(f"Detected subject (translate INBOX): {sub} (from={sender}, uid={uid})")
+            yield ('INBOX', uid, msg)
+
+def translate_job(cfg: dict):
+    logger.info("Translate job started")
+    imap = cfg['imap']; pref = cfg.get('prefix', {'translate':'[机器翻译]','summarize':'[机器总结]'})
+    excluded = [pref.get('translate','[机器翻译]'), pref.get('summarize','[机器总结]')]
+
+    llm_cfg = cfg.get('llm', {})
+    use_mock = bool(llm_cfg.get('mock', False) or cfg.get('test', {}).get('mock_llm', False))
+    translate_timeout = float(llm_cfg.get('translate_timeout_seconds', llm_cfg.get('request_timeout_seconds', 15.0)))
+    if not use_mock:
+        sf = llm_cfg.get('siliconflow') or cfg.get('siliconflow2') or cfg.get('siliconflow')
+        if not sf:
+            raise ValueError('No LLM provider configured for translation')
+        cli = new_openai(sf['api_base'], sf['api_key'], timeout=translate_timeout)
+        trans_model = llm_cfg.get('translator_model') or (cfg.get('siliconflow2',{}) or {}).get('model') or (sf.get('model')) or 'Qwen/Qwen2.5-7B-Instruct'
+    else:
+        cli = None
+        trans_model = ''
+
+    c = connect(imap['server'], imap['email'], imap['password'], port=imap.get('port',993), ssl=imap.get('ssl',True))
+    try:
+        for folder, uid, msg in scan_translate_targets(c, cfg, excluded):
+            sub = decode_subject(msg)
+            logger.info(f"Processing subject (translate): {sub} in {folder} (uid={uid})")
+            html, text = pick_html_or_text(msg)
+            if not html and text:
+                html = f"<html><body><pre>{text}</pre></body></html>"
+            if not html:
+                logger.info("Skip empty body; mark seen")
+                mark_seen(c, folder, uid)
+                continue
+
+            # idempotency: skip if already handled
+            orig_msgid = msg.get('Message-ID') or ''
+            if orig_msgid and has_linked_reply(c, folder, orig_msgid, pref.get('translate','[机器翻译]')):
+                logger.info("Skip already translated (idempotent)")
+                mark_seen(c, folder, uid)
+                continue
+
+            strict_line = bool(cfg.get('translate', {}).get('strict_line', True))
+            if strict_line:
+                if use_mock:
+                    zh_html = inject_bilingual_html_linewise(html, translate_batch_mock)
+                else:
+                    zh_html = inject_bilingual_html_linewise(html, lambda segs: qwen_translate_batch(cli, trans_model, segs, timeout=translate_timeout))
+                # and a block-level pass to catch block-only cases
+                if use_mock:
+                    zh_html = inject_bilingual_html_conservative(zh_html or html, translate_batch_mock)
+                else:
+                    zh_html = inject_bilingual_html_conservative(zh_html or html, lambda segs: qwen_translate_batch(cli, trans_model, segs, timeout=translate_timeout))
+            else:
+                if use_mock:
+                    zh_html = inject_bilingual_html(html, translate_batch_mock)
+                else:
+                    zh_html = inject_bilingual_html(html, lambda segs: qwen_translate_batch(cli, trans_model, segs, timeout=translate_timeout))
+                # then conservative pass to catch leftovers
+                if use_mock:
+                    zh_html = inject_bilingual_html_conservative(zh_html or html, translate_batch_mock)
+                else:
+                    zh_html = inject_bilingual_html_conservative(zh_html or html, lambda segs: qwen_translate_batch(cli, trans_model, segs, timeout=translate_timeout))
+            new_subject = f"{pref.get('translate','[机器翻译]')} {sub}"
+            out = build_email(new_subject, imap['email'], imap['email'], zh_html, None, in_reply_to=msg.get('Message-ID'))
+            append_unseen(c, folder or 'INBOX', out)
+            mark_seen(c, folder, uid)
+            logger.info(f"Appended translated mail: {new_subject}")
+    finally:
+        try:
+            c.logout()
+        except Exception:
+            pass
+    logger.info("Translate job finished")

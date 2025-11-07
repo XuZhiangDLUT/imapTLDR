@@ -1,4 +1,5 @@
 import json
+from json import JSONDecodeError
 from pathlib import Path
 
 CONFIG_PATH = Path(__file__).resolve().parents[1] / "config.json"
@@ -6,5 +7,6 @@ CONFIG_PATH = Path(__file__).resolve().parents[1] / "config.json"
 
 def load_config(path: Path | None = None) -> dict:
     p = Path(path) if path else CONFIG_PATH
-    with p.open("r", encoding="utf-8") as f:
+    # Use utf-8-sig to tolerate BOM in JSON files written by various tools
+    with p.open("r", encoding="utf-8-sig") as f:
         return json.load(f)

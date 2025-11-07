@@ -1,48 +1,86 @@
-{
-  "imap": {
-    "server": "imap.qq.com",
-    "port": 993,
-    "ssl": true,
-    "email": "you@example.com",
-    "password": "YOUR_IMAP_AUTH_CODE",
-    "folder": "INBOX"
-  },
-  "prefix": { "summarize": "[机器总结]" },
-  "timezone": "Asia/Shanghai",
-
-
-  "summarize": {
-    "cron": ["0 7 * * *", "0 12 * * *", "0 19 * * *"],
-    "folders": [
-      "其他文件夹/Nature",
-      "其他文件夹/APS Extended",
-      "其他文件夹/PNAS",
-      "其他文件夹/Science",
-      "其他文件夹/Materials",
-      "其他文件夹/AFM",
-      "其他文件夹/AdvMaterial",
-      "其他文件夹/R. Soc. A",
-      "其他文件夹/Adv.Sci."
-    ],
-    "batch_size": 10,
-    "chunk_tokens": 16000,
-    "unseen_fetch_chunk": 500,
-    "max_unseen_per_run_per_folder": 0,
-    "scan_order": "newest"
-  },
-
-  "llm": {
-    "mock": true,
-    "siliconflow": {
-      "api_base": "https://api.siliconflow.cn",
-      "api_key": "YOUR_SILICONFLOW_API_KEY",
-      "model": "deepseek-ai/DeepSeek-V3.2-Exp"
-    },
-    "summarizer_model": "deepseek-ai/DeepSeek-V3.2-Exp",
-    "enable_thinking": true,
-    "thinking_budget": 4096,
-    "prompt_file": "Prompt.txt",
-    "request_timeout_seconds": 15,
-    "summarize_timeout_seconds": 15
-  }
+﻿{
+    "imap":  {
+                 "server":  "imap.qq.com",
+                 "port":  993,
+                 "ssl":  true,
+                 "email":  "you@example.com",
+                 "password":  "YOUR_IMAP_AUTH_CODE",
+                 "folder":  "INBOX"
+             },
+    "prefix":  {
+                   "summarize":  "[机器总结]",
+                   "translate":  "[机器翻译]"
+               },
+    "timezone":  "Asia/Shanghai",
+    "summarize":  {
+                      "cron":  [
+                                   "0 7 * * *",
+                                   "0 12 * * *",
+                                   "0 19 * * *"
+                               ],
+                      "folders":  [
+                                      "其他文件夹/Nature",
+                                      "其他文件夹/APS Extended",
+                                      "其他文件夹/PNAS",
+                                      "其他文件夹/Science",
+                                      "其他文件夹/Materials",
+                                      "其他文件夹/AFM",
+                                      "其他文件夹/AdvMaterial",
+                                      "其他文件夹/R. Soc. A",
+                                      "其他文件夹/Adv.Sci."
+                                  ],
+                      "batch_size":  10,
+                      "chunk_tokens":  16000,
+                      "unseen_fetch_chunk":  500,
+                      "max_unseen_per_run_per_folder":  0,
+                      "scan_order":  "newest"
+                  },
+    "llm":  {
+                "mock":  true,
+                "siliconflow":  {
+                                    "api_base":  "https://api.siliconflow.cn",
+                                    "api_key":  "YOUR_SILICONFLOW_API_KEY",
+                                    "model":  "deepseek-ai/DeepSeek-V3.2-Exp"
+                                },
+                "summarizer_model":  "deepseek-ai/DeepSeek-V3.2-Exp",
+                "enable_thinking":  true,
+                "thinking_budget":  4096,
+                "prompt_file":  "Prompt.txt",
+                "request_timeout_seconds":  15,
+                "summarize_timeout_seconds":  15,
+                "translator_model":  "Qwen/Qwen2.5-7B-Instruct",
+                "translate_timeout_seconds":  15
+            },
+    "translate":  {
+                      "interval_minutes":  10,
+                      "folders":  [
+                                      "IJSS",
+                                      "TWS",
+                                      "JMPS",
+                                      "EML",
+                                      "PRL",
+                                      "IJMS",
+                                      "IJNME",
+                                      "CMAME",
+                                      "ComputerStruct",
+                                      "SMO",
+                                      "ES",
+                                      "NLDyna",
+                                      "JSV",
+                                      "IJIE",
+                                      "OceanEng",
+                                      "Def. Technol.",
+                                      "Eur.J.Mech.",
+                                      "CompositeStruct"
+                                  ],
+                      "inbox_keywords":  [
+                                             "相关研究汇总",
+                                             "快讯汇总"
+                                         ],
+                      "inbox_from":  [
+                                         "scholaralerts-noreply@google.com"
+                                     ],
+                      "max_per_run_per_folder":  3,
+                      "strict_line":  true
+                  }
 }
