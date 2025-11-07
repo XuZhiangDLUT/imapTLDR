@@ -1,5 +1,6 @@
 from __future__ import annotations
 from bs4 import BeautifulSoup, NavigableString
+import logging
 from copy import deepcopy
 from premailer import transform as inline_css
 
@@ -8,6 +9,8 @@ from premailer import transform as inline_css
 # 2) Collect block nodes (p/li/h2/h3) in document order with strict filtering
 # 3) Clone each node, replace text nodes with translated text (preserve inline structure)
 # 4) Insert clone right after original, mark as notranslate to avoid re-processing
+
+logger = logging.getLogger("mailbot")
 
 MARK_ATTR = "data-translationmark"
 MARK_ORIGINAL_DISPLAY = "data-translationoriginaldisplay"
@@ -210,9 +213,21 @@ def _replace_clone_text_preserving_structure(clone, translated: str):
         n.replace_with(chunk)
 
 
+def _safe_inline(html: str) -> str:
+    try:
+        return inline_css(html)
+    except Exception as e:
+        # Avoid network 403/timeout from external CSS; fall back to raw HTML
+        try:
+            logger.info(f"Inline CSS skipped due to error: {e}")
+        except Exception:
+            pass
+        return html
+
+
 def inject_bilingual_html(html: str, translate_batch):
-    # inline css first to preserve styles across mail clients
-    soup = BeautifulSoup(inline_css(html), "html5lib")
+    # inline css first to preserve styles across mail clients (but be resilient)
+    soup = BeautifulSoup(_safe_inline(html), "html5lib")
     # detect main content container(s)
     roots = _find_content_container(soup)
     # collect candidates
@@ -367,7 +382,7 @@ def inject_bilingual_html_conservative(html: str, translate_batch):
     Robust per-block injection: for typical text blocks (p/li/h*/td/th/div without nested blocks)
     append one next-line translation inside the same block.
     """
-    soup = BeautifulSoup(inline_css(html), 'html5lib')
+    soup = BeautifulSoup(_safe_inline(html), 'html5lib')
     elems = []
     picked_set = set()
 
@@ -506,7 +521,7 @@ def inject_bilingual_html_linewise(html: str, translate_batch):
     whenever a child segment contains English, translate it and insert a new blocky span/div
     immediately after that segment (not at the end of the container).
     """
-    soup = BeautifulSoup(inline_css(html), 'html5lib')
+    soup = BeautifulSoup(_safe_inline(html), 'html5lib')
     segments = []  # list of (node, text, mode)
 
     def push_segment(node, text):
@@ -617,7 +632,7 @@ def translate_html_inplace(html: str, translate_batch):
     - Between original and translation, insert exactly one space
     - Preserves surrounding whitespace and newlines exactly
     """
-    soup = BeautifulSoup(inline_css(html), 'html5lib')
+    soup = BeautifulSoup(_safe_inline(html), 'html5lib')
 
     # Build translation requests by scanning text nodes
     requests = []  # list[str]
