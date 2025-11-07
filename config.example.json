@@ -83,7 +83,7 @@
                       "max_per_run_per_folder":  3,
                       "strict_line":  true,
                       "inplace_replace":  true,
-                      "concurrency":  6,
+                      "concurrency":  10,
                       "rpm_limit":  1000,
                       "tpm_limit":  50000
                   }
