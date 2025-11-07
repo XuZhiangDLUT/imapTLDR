@@ -401,8 +401,7 @@ def qwen_translate_single(cli: OpenAI, model: str, text: str, timeout: float | i
     )
     user_prompt = (
         "<translate_input>\n" + (text or "") + "\n</translate_input>\n\n"
-        "Translate the above text enclosed with <translate_input> into simple  Chinese without <translate_input>.   "
-        "注意 RPM 为 1,000；TPM 为 50,000 。如果触发限流请等待，超时时长为300s 。"
+        "Translate the above text enclosed with <translate_input> into simple Chinese without <translate_input>."
     )
     try:
         r = cli.chat.completions.create(
