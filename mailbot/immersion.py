@@ -607,17 +607,21 @@ def inject_bilingual_html_linewise(html: str, translate_batch):
 # In-place: translate text nodes only, keep DOM unchanged
 def translate_html_inplace(html: str, translate_batch):
     """
-    Translate visible text nodes in place without adding any new elements.
+    Translate visible text nodes "in-place" by keeping the original text
+    and appending the translation right after it within the same location.
+    - The translation is wrapped in an inline span with a vivid color, while
+      inheriting other typography to avoid layout shifts.
     - Skips script/style/noscript/textarea/svg/form/button and <code>/<pre>
     - Splits each text node by newlines (keeps delimiters) and translates
       only parts that look like English
+    - Between original and translation, insert exactly one space
     - Preserves surrounding whitespace and newlines exactly
     """
     soup = BeautifulSoup(inline_css(html), 'html5lib')
 
     # Build translation requests by scanning text nodes
     requests = []  # list[str]
-    slots = []     # list of (text_node, token_index, leading, trailing)
+    slots = []     # list of (text_node, token_index, leading, core, trailing)
 
     SKIP_PARENTS = set(['script','style','svg','form','button','noscript','textarea','code','pre'])
 
@@ -661,7 +665,7 @@ def translate_html_inplace(html: str, translate_batch):
             if not _is_probably_english_text(core):
                 continue
             requests.append(core)
-            slots.append((node, idx, lead, tail))
+            slots.append((node, idx, lead, core, tail))
 
     if not requests:
         return str(soup)
@@ -678,30 +682,48 @@ def translate_html_inplace(html: str, translate_batch):
     # Apply back to nodes
     # Build a mapping from text node to its token list to reconstruct once
     from collections import defaultdict
-    token_map = defaultdict(list)  # node -> list of tokens
-    filled = defaultdict(int)      # node -> number of replacements filled so far
-    # Pre-split all nodes once
     import re as _re2
-    for node in {n for (n, _, _, _) in slots}:
-        token_map[node] = _re2.split(r'(\r?\n)', str(node))
-
+    # Group slots per node
+    per_node = defaultdict(list)
     rpos = 0
-    for (node, token_index, lead, tail) in slots:
-        if rpos >= len(results):
-            break
-        tr = results[rpos] or ''
+    for (node, token_index, lead, core, tail) in slots:
+        tr = results[rpos] if rpos < len(results) else ''
         rpos += 1
-        # Rebuild this token with preserved whitespace
-        cur = token_map[node][token_index]
-        if cur in ('\n','\r\n'):
-            continue
-        # replace only the core, keep leading/trailing spaces
-        token_map[node][token_index] = f"{lead}{tr}{tail}"
+        per_node[node].append({'i': token_index, 'lead': lead, 'core': core, 'tail': tail, 'tr': tr or ''})
 
-    # Write back to DOM
-    for node, tokens in token_map.items():
+    # Apply to each node by reconstructing as a sequence of NavigableString and inline spans
+    for node, slot_list in per_node.items():
         try:
-            node.replace_with(''.join(tokens))
+            tokens = _re2.split(r'(\r?\n)', str(node))
+            map_idx = {s['i']: s for s in slot_list}
+            pieces = []
+            for idx, tok in enumerate(tokens):
+                if tok in ('\n','\r\n'):
+                    pieces.append(NavigableString(tok))
+                    continue
+                slot = map_idx.get(idx)
+                if not slot:
+                    pieces.append(NavigableString(tok))
+                else:
+                    # original + single space + colored translation + trailing
+                    before = f"{slot['lead']}{slot['core']} "
+                    pieces.append(NavigableString(before))
+                    span = soup.new_tag('span')
+                    span[MARK_ATTR] = 'inplace'
+                    cls = set(span.get('class', []) or [])
+                    cls.add(NOTRANSLATE_CLASS)
+                    span['class'] = list(cls)
+                    # vivid color, keep other typography unchanged
+                    span['style'] = 'color:#ff1744;font:inherit;line-height:inherit;'
+                    span.string = slot['tr']
+                    pieces.append(span)
+                    if slot['tail']:
+                        pieces.append(NavigableString(slot['tail']))
+
+            # replace original text node with new fragments
+            for p in pieces:
+                node.insert_before(p)
+            node.extract()
         except Exception:
             continue
 
