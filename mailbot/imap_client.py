@@ -163,9 +163,16 @@ def append_unseen(client: IMAPClient, folder: str, msg: EmailMessage):
                         candidates.extend(by_sub[-1:])  # last one most likely the appended
                 except Exception:
                     pass
+        # De-dup and select the most recent UID only to avoid toggling older items
         if candidates:
-            client.remove_flags(candidates, [b'\\Seen'])
-            logger.info(f"Enforce UNSEEN on appended mail: folder={folder}, uids={candidates}")
+            try:
+                uniq = sorted({int(u) for u in candidates})
+            except Exception:
+                uniq = candidates[-1:]
+            target = [uniq[-1]] if uniq else []
+            if target:
+                client.remove_flags(target, [b'\\Seen'])
+                logger.info(f"Enforce UNSEEN on appended mail: folder={folder}, uid={target[0]}")
         else:
             logger.info(f"Could not locate appended mail for UNSEEN enforcement: folder={folder}, subject={subj}")
     except Exception as e:
