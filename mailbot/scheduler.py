@@ -87,6 +87,10 @@ def start_scheduler():
     # Translate interval is measured from finish time (fixed-delay)
     interval_minutes = int(cfg.get("translate", {}).get("interval_minutes", 10))
     translate_delay = timedelta(minutes=interval_minutes)
+    summarize_cfg = cfg.get("summarize", {})
+    follow_translate_interval = bool(
+        summarize_cfg.get("follow_translate_interval", False)
+    )
 
     # Single-thread critical section to avoid race; summarize has higher priority by policy
     RUN_LOCK = threading.RLock()
@@ -126,6 +130,13 @@ def start_scheduler():
         # schedule next translate from finish time
         _schedule_translate_next(translate_delay)
 
+        if follow_translate_interval:
+            logger.info(
+                "NEXT summarize triggered immediately after translate "
+                "(follow_translate_interval=true)"
+            )
+            _run_summarize()
+
         # if summarize was delayed while translating, run catch-up immediately
         if summarize_pending.get("flag"):
             summarize_pending["flag"] = False
@@ -133,10 +144,13 @@ def start_scheduler():
             logger.info("FLAG summarize pending -> scheduled immediate catch-up")
 
     # Summarize jobs (strict on-the-hour cron). If missed, run ASAP afterwards
-    summarize_specs = cfg.get("summarize", {}).get("cron", ["0 7 * * *", "0 12 * * *", "0 19 * * *"])
-    for spec in summarize_specs:
-        jid = f"summarize:{spec}"
-        sch.add_job(_run_summarize, CronTrigger.from_crontab(spec, timezone=tz), id=jid, misfire_grace_time=3600)
+    summarize_specs = summarize_cfg.get("cron", ["0 7 * * *", "0 12 * * *", "0 19 * * *"])
+    if follow_translate_interval:
+        logger.info("Summarize configured to follow translate interval; cron schedule disabled")
+    else:
+        for spec in summarize_specs:
+            jid = f"summarize:{spec}"
+            sch.add_job(_run_summarize, CronTrigger.from_crontab(spec, timezone=tz), id=jid, misfire_grace_time=3600)
 
     # Warm-up: run summarize once immediately at startup (higher priority)
     try:

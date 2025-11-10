@@ -8,6 +8,7 @@ from datetime import datetime
 import json
 from pathlib import Path as _Path
 from premailer import transform as inline_css
+import re
 
 logger = logging.getLogger("mailbot")
 
@@ -146,6 +147,31 @@ DEFAULT_SUMMARY_FOLDERS = [
     "其他文件夹/Nature","其他文件夹/APS Extended","其他文件夹/PNAS","其他文件夹/Science",
     "其他文件夹/Materials","其他文件夹/AFM","其他文件夹/AdvMaterial","其他文件夹/R. Soc. A","其他文件夹/Adv.Sci.",
 ]
+
+_CJK_RE = re.compile(r"[\u4e00-\u9fff]")
+_ASCII_RE = re.compile(r"[A-Za-z]")
+
+
+def _segment_needs_translation(text: str | None) -> bool:
+    """Heuristic: translate only segments that contain ASCII letters."""
+    if not text:
+        return False
+    return bool(_ASCII_RE.search(text))
+
+
+def _looks_translated(src: str | None, dst: str | None) -> bool:
+    """Detect whether dst appears to contain a translated result."""
+    dst = (dst or "").strip()
+    if not dst:
+        return False
+    # Segments without English letters don't strictly need changes.
+    if not _segment_needs_translation(src):
+        return True
+    if _CJK_RE.search(dst):
+        return True
+    src_norm = (src or "").strip()
+    # consider it translated if content changed even without CJK (fallback)
+    return bool(src_norm) and dst != src_norm
 
 
 def new_openai(api_base: str, api_key: str, timeout: float | int = 15.0) -> OpenAI:
@@ -467,6 +493,13 @@ def translate_job(cfg: dict):
     llm_cfg = cfg.get('llm', {})
     use_mock = bool(llm_cfg.get('mock', False) or cfg.get('test', {}).get('mock_llm', False))
     translate_timeout = float(llm_cfg.get('translate_timeout_seconds', llm_cfg.get('request_timeout_seconds', 300.0)))
+    tcfg = cfg.get('translate', {})
+    inplace = bool(tcfg.get('inplace_replace', False))
+    strict_line = bool(tcfg.get('strict_line', True))
+    max_translate_attempts = max(1, int(tcfg.get('max_retry', 3)))
+    rpm_limit = int(tcfg.get('rpm_limit', 1000))
+    tpm_limit = int(tcfg.get('tpm_limit', 50000))
+    max_workers = int(tcfg.get('concurrency', 6))
     if not use_mock:
         sf = llm_cfg.get('siliconflow') or cfg.get('siliconflow2') or cfg.get('siliconflow')
         if not sf:
@@ -476,6 +509,98 @@ def translate_job(cfg: dict):
     else:
         cli = None
         trans_model = ''
+
+    if use_mock:
+        def _base_translator(batch: list[str]) -> list[str]:
+            return translate_batch_mock(batch)
+    else:
+        import time as _t
+        import threading as _th
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        class TokenBucket:
+            def __init__(self, capacity: float, refill_per_sec: float):
+                self.capacity = float(max(1.0, capacity))
+                self.refill = float(max(0.01, refill_per_sec))
+                self.tokens = float(capacity)
+                self.ts = _t.monotonic()
+                self.lock = _th.Lock()
+
+            def acquire(self, amount: float):
+                amount = float(max(0.0, amount))
+                while True:
+                    with self.lock:
+                        now = _t.monotonic()
+                        elapsed = now - self.ts
+                        if elapsed > 0:
+                            self.tokens = min(self.capacity, self.tokens + elapsed * self.refill)
+                            self.ts = now
+                        if self.tokens >= amount:
+                            self.tokens -= amount
+                            return
+                        need = (amount - self.tokens) / self.refill
+                    _t.sleep(min(0.25, max(need, 0.02)))
+
+        req_bucket = TokenBucket(capacity=float(rpm_limit), refill_per_sec=float(rpm_limit) / 60.0)
+        tok_bucket = TokenBucket(capacity=float(tpm_limit), refill_per_sec=float(tpm_limit) / 60.0)
+
+        def do_one(idx: int, seg: str) -> tuple[int, str]:
+            # estimate tokens (rough) for limit accounting
+            try:
+                est_tokens = max(1, int(rough_token_count(seg) + 64))
+            except Exception:
+                est_tokens = 128
+            # acquire rate limits
+            req_bucket.acquire(1.0)
+            tok_bucket.acquire(float(est_tokens))
+            out = qwen_translate_single(cli, trans_model, seg, timeout=translate_timeout)
+            return idx, out
+
+        def _base_translator(batch: list[str]) -> list[str]:
+            if not batch:
+                return []
+            outs = [''] * len(batch)
+            with ThreadPoolExecutor(max_workers=max_workers) as ex:
+                futures = [ex.submit(do_one, i, x) for i, x in enumerate(batch)]
+                for fut in as_completed(futures):
+                    try:
+                        i, res = fut.result()
+                        outs[i] = (res or '').strip()
+                    except Exception as e:
+                        # fill empty on failure for this segment
+                        logger.info(f"translate future failed: {e}")
+            return outs
+
+    def translator(batch: list[str]) -> list[str]:
+        if not batch:
+            return []
+        pending = list(range(len(batch)))
+        outs = [''] * len(batch)
+        attempt = 0
+        while pending and attempt < max_translate_attempts:
+            attempt += 1
+            sub_batch = [batch[i] for i in pending]
+            try:
+                results = _base_translator(sub_batch) or []
+            except Exception as exc:
+                logger.warning(f"translate batch attempt {attempt} raised error: {exc}")
+                results = [''] * len(sub_batch)
+            if len(results) < len(sub_batch):
+                # pad to align indexes
+                results = (results + [''] * len(sub_batch))[:len(sub_batch)]
+            for idx, res in zip(pending, results):
+                outs[idx] = (res or '').strip()
+            pending = [idx for idx in pending if not _looks_translated(batch[idx], outs[idx])]
+            if pending and attempt < max_translate_attempts:
+                logger.warning(
+                    f"translate retry {attempt}/{max_translate_attempts} scheduled for {len(pending)} segments"
+                )
+        if pending:
+            logger.warning(
+                f"translate retries exhausted after {max_translate_attempts} attempts; "
+                f"{len(pending)} segments still empty"
+            )
+        return outs
 
     c = connect(imap['server'], imap['email'], imap['password'], port=imap.get('port',993), ssl=imap.get('ssl',True))
     try:
@@ -496,77 +621,6 @@ def translate_job(cfg: dict):
                 logger.info("Skip already translated (idempotent)")
                 mark_seen(c, folder, uid)
                 continue
-
-            tcfg = cfg.get('translate', {})
-            inplace = bool(tcfg.get('inplace_replace', False))
-            strict_line = bool(tcfg.get('strict_line', True))
-
-            # Build a translator wrapper that calls the model per-segment with bounded concurrency
-            if use_mock:
-                def translator(batch: list[str]) -> list[str]:
-                    return translate_batch_mock(batch)
-            else:
-                # Concurrency and rate limits
-                rpm_limit = int(tcfg.get('rpm_limit', 1000))
-                tpm_limit = int(tcfg.get('tpm_limit', 50000))
-                max_workers = int(tcfg.get('concurrency', 6))
-
-                import time as _t
-                import threading as _th
-                from concurrent.futures import ThreadPoolExecutor, as_completed
-
-                class TokenBucket:
-                    def __init__(self, capacity: float, refill_per_sec: float):
-                        self.capacity = float(max(1.0, capacity))
-                        self.refill = float(max(0.01, refill_per_sec))
-                        self.tokens = float(capacity)
-                        self.ts = _t.monotonic()
-                        self.lock = _th.Lock()
-
-                    def acquire(self, amount: float):
-                        amount = float(max(0.0, amount))
-                        while True:
-                            with self.lock:
-                                now = _t.monotonic()
-                                elapsed = now - self.ts
-                                if elapsed > 0:
-                                    self.tokens = min(self.capacity, self.tokens + elapsed * self.refill)
-                                    self.ts = now
-                                if self.tokens >= amount:
-                                    self.tokens -= amount
-                                    return
-                                need = (amount - self.tokens) / self.refill
-                            _t.sleep(min(0.25, max(need, 0.02)))
-
-                req_bucket = TokenBucket(capacity=float(rpm_limit), refill_per_sec=float(rpm_limit)/60.0)
-                tok_bucket = TokenBucket(capacity=float(tpm_limit), refill_per_sec=float(tpm_limit)/60.0)
-
-                def do_one(idx: int, seg: str) -> tuple[int, str]:
-                    # estimate tokens (rough) for limit accounting
-                    try:
-                        est_tokens = max(1, int(rough_token_count(seg) + 64))
-                    except Exception:
-                        est_tokens = 128
-                    # acquire rate limits
-                    req_bucket.acquire(1.0)
-                    tok_bucket.acquire(float(est_tokens))
-                    out = qwen_translate_single(cli, trans_model, seg, timeout=translate_timeout)
-                    return idx, out
-
-                def translator(batch: list[str]) -> list[str]:
-                    if not batch:
-                        return []
-                    outs = [''] * len(batch)
-                    with ThreadPoolExecutor(max_workers=max_workers) as ex:
-                        futures = [ex.submit(do_one, i, x) for i, x in enumerate(batch)]
-                        for fut in as_completed(futures):
-                            try:
-                                i, res = fut.result()
-                                outs[i] = (res or '').strip()
-                            except Exception as e:
-                                # fill empty on failure for this segment
-                                logger.info(f"translate future failed: {e}")
-                    return outs
 
             if inplace:
                 zh_html = translate_html_inplace(html, translator)
