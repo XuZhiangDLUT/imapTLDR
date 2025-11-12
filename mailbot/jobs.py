@@ -622,16 +622,52 @@ def translate_job(cfg: dict):
                 mark_seen(c, folder, uid)
                 continue
 
+            # Per-mail memo: reuse successful translations for identical source text
+            memo: dict[str, str] = {}
+            def _norm(s: str) -> str:
+                try:
+                    return " ".join((s or '').split())
+                except Exception:
+                    return (s or '').strip()
+
+            def memo_translator(batch: list[str]) -> list[str]:
+                if not batch:
+                    return []
+                # Fill from memo where possible
+                outs = [''] * len(batch)
+                need_idx: list[int] = []
+                need_texts: list[str] = []
+                for i, seg in enumerate(batch):
+                    k = _norm(seg)
+                    if k and k in memo:
+                        outs[i] = memo[k]
+                    else:
+                        need_idx.append(i)
+                        need_texts.append(seg)
+                # Translate remaining items with retrying translator
+                if need_texts:
+                    res = translator(need_texts) or []
+                    if len(res) < len(need_texts):
+                        res = (res + [''] * len(need_texts))[:len(need_texts)]
+                    for j, idx in enumerate(need_idx):
+                        src = need_texts[j]
+                        tr = (res[j] or '').strip()
+                        outs[idx] = tr
+                        # Memoize only if it looks like a valid translation
+                        if _looks_translated(src, tr):
+                            memo[_norm(src)] = tr
+                return outs
+
             if inplace:
-                zh_html = translate_html_inplace(html, translator)
+                zh_html = translate_html_inplace(html, memo_translator)
             elif strict_line:
-                zh_html = inject_bilingual_html_linewise(html, translator)
+                zh_html = inject_bilingual_html_linewise(html, memo_translator)
                 # and a block-level pass to catch block-only cases
-                zh_html = inject_bilingual_html_conservative(zh_html or html, translator)
+                zh_html = inject_bilingual_html_conservative(zh_html or html, memo_translator)
             else:
-                zh_html = inject_bilingual_html(html, translator)
+                zh_html = inject_bilingual_html(html, memo_translator)
                 # then conservative pass to catch leftovers
-                zh_html = inject_bilingual_html_conservative(zh_html or html, translator)
+                zh_html = inject_bilingual_html_conservative(zh_html or html, memo_translator)
             new_subject = f"{pref.get('translate','[机器翻译]')} {sub}"
             out = build_email(new_subject, imap['email'], imap['email'], zh_html, None, in_reply_to=msg.get('Message-ID'))
             append_unseen(c, folder or 'INBOX', out)
