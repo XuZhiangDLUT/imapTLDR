@@ -500,15 +500,19 @@ def translate_job(cfg: dict):
     rpm_limit = int(tcfg.get('rpm_limit', 1000))
     tpm_limit = int(tcfg.get('tpm_limit', 50000))
     max_workers = int(tcfg.get('concurrency', 6))
+    # 主翻译模型（通常是 Qwen），以及可选的 DeepSeek 兜底模型
     if not use_mock:
         sf = llm_cfg.get('siliconflow') or cfg.get('siliconflow2') or cfg.get('siliconflow')
         if not sf:
             raise ValueError('No LLM provider configured for translation')
         cli = new_openai(sf['api_base'], sf['api_key'], timeout=translate_timeout)
         trans_model = llm_cfg.get('translator_model') or (cfg.get('siliconflow2',{}) or {}).get('model') or (sf.get('model')) or 'Qwen/Qwen2.5-7B-Instruct'
+        # 使用 summarize 部分配置的 DeepSeek 模型作为翻译兜底模型；不启用思考，仅作普通翻译调用
+        fallback_model = llm_cfg.get('summarizer_model') or ''
     else:
         cli = None
         trans_model = ''
+        fallback_model = ''
 
     if use_mock:
         def _base_translator(batch: list[str]) -> list[str]:
@@ -577,6 +581,7 @@ def translate_job(cfg: dict):
         pending = list(range(len(batch)))
         outs = [''] * len(batch)
         attempt = 0
+        # 先使用主翻译模型（通常是 Qwen）进行多轮重试
         while pending and attempt < max_translate_attempts:
             attempt += 1
             sub_batch = [batch[i] for i in pending]
@@ -595,10 +600,42 @@ def translate_job(cfg: dict):
                 logger.warning(
                     f"translate retry {attempt}/{max_translate_attempts} scheduled for {len(pending)} segments"
                 )
+
+        # 对仍然不合格的段落，使用 DeepSeek（summarizer_model）兜底翻译一次，不启用思考
+        if pending and fallback_model:
+            logger.warning(
+                f"translate fallback: using fallback model={fallback_model} for {len(pending)} segments"
+            )
+            for idx in list(pending):
+                src = batch[idx]
+                if not src:
+                    continue
+                # 兜底同样走简单的限流控制，避免压垮后端
+                try:
+                    est_tokens = max(1, int(rough_token_count(src) + 64))
+                except Exception:
+                    est_tokens = 128
+                try:
+                    # 只有在非 mock 模式下才会定义桶；若因为配置问题缺失，下面 acquire 会被 try/except 吃掉
+                    req_bucket.acquire(1.0)
+                    tok_bucket.acquire(float(est_tokens))
+                except Exception:
+                    pass
+                try:
+                    # 直接复用 qwen_translate_single 的翻译 prompt，只是换成 DeepSeek 模型；
+                    # 不传任何 enable_thinking / thinking_budget 之类的额外参数。
+                    tr = qwen_translate_single(cli, fallback_model, src, timeout=translate_timeout)
+                except Exception as exc:
+                    logger.info(f"fallback translate error: {exc}")
+                    tr = ''
+                outs[idx] = (tr or '').strip()
+            # 兜底后再检查一遍哪些段落仍然看起来“没有翻译成功”
+            pending = [idx for idx in pending if not _looks_translated(batch[idx], outs[idx])]
+
         if pending:
             logger.warning(
                 f"translate retries exhausted after {max_translate_attempts} attempts; "
-                f"{len(pending)} segments still empty"
+                f"{len(pending)} segments still empty (after fallback)"
             )
         return outs
 
@@ -625,37 +662,94 @@ def translate_job(cfg: dict):
             # Per-mail memo: reuse successful translations for identical source text
             memo: dict[str, str] = {}
             def _norm(s: str) -> str:
+                """Normalize as a stable cache key: collapse whitespace, keep content."""
                 try:
-                    return " ".join((s or '').split())
+                    return " ".join((s or "").split())
                 except Exception:
-                    return (s or '').strip()
+                    return (s or "").strip()
 
             def memo_translator(batch: list[str]) -> list[str]:
+                """
+                Batch translator with per-mail memoization.
+
+                1) 先用 _norm 归一化文本，如果已经在 memo 里，则直接复用；
+                2) 对于本次调用中尚未缓存的文本：
+                   - 相同的 _norm(s) 只向底层 translator 请求一次（去重）；
+                   - 得到译文后，回填到这一批中所有相同段落；
+                这样可以避免“同一封邮件里相同段落，有的翻译成功、有的失败”。
+                """
                 if not batch:
                     return []
-                # Fill from memo where possible
-                outs = [''] * len(batch)
-                need_idx: list[int] = []
-                need_texts: list[str] = []
+
+                # 最终输出，与输入 batch 等长
+                outs: list[str] = [""] * len(batch)
+
+                # 已知缓存的直接填充，剩余的收集成请求
+                request_texts: list[str] = []
+                request_kind: list[str] = []          # 'keyed' or 'single'
+                request_key: list[str | None] = []
+                request_single_idx: list[int] = []
+
+                # key -> 对应的所有输出位置索引（同一封邮件内的“相同段落”）
+                key_to_out_indexes: dict[str, list[int]] = {}
+                # key -> 在 request_texts 中的下标，保证每个 key 只翻译一次
+                key_to_req_index: dict[str, int] = {}
+
                 for i, seg in enumerate(batch):
                     k = _norm(seg)
                     if k and k in memo:
+                        # 已有缓存：直接填充
                         outs[i] = memo[k]
+                        continue
+
+                    if k:
+                        # 归一化后非空：按 key 合并请求
+                        if k not in key_to_req_index:
+                            key_to_req_index[k] = len(request_texts)
+                            request_texts.append(seg)
+                            request_kind.append("keyed")
+                            request_key.append(k)
+                            request_single_idx.append(-1)
+                        key_to_out_indexes.setdefault(k, []).append(i)
                     else:
-                        need_idx.append(i)
-                        need_texts.append(seg)
-                # Translate remaining items with retrying translator
-                if need_texts:
-                    res = translator(need_texts) or []
-                    if len(res) < len(need_texts):
-                        res = (res + [''] * len(need_texts))[:len(need_texts)]
-                    for j, idx in enumerate(need_idx):
-                        src = need_texts[j]
-                        tr = (res[j] or '').strip()
+                        # 无稳定 key（基本是空白/奇怪片段），逐条请求，不做 memo
+                        request_texts.append(seg)
+                        request_kind.append("single")
+                        request_key.append(None)
+                        request_single_idx.append(i)
+
+                # 没有需要翻译的新文本，直接返回缓存结果
+                if not request_texts:
+                    return outs
+
+                # 统一调用带重试的底层 translator
+                res = translator(request_texts) or []
+                if len(res) < len(request_texts):
+                    res = (res + [""] * len(request_texts))[:len(request_texts)]
+
+                # 将结果分发回各个位置，并在本邮件内建立 memo
+                for req_idx, src in enumerate(request_texts):
+                    tr = (res[req_idx] or "").strip()
+                    kind = request_kind[req_idx]
+                    key = request_key[req_idx]
+
+                    if kind == "single":
+                        idx = request_single_idx[req_idx]
+                        if idx >= 0:
+                            outs[idx] = tr
+                        # 这类通常没有稳定 key，不放入 memo
+                        continue
+
+                    # 'keyed'：相同 key 的所有位置共享同一个译文
+                    if not key:
+                        continue
+                    idxs = key_to_out_indexes.get(key, []) or []
+                    for idx in idxs:
                         outs[idx] = tr
-                        # Memoize only if it looks like a valid translation
-                        if _looks_translated(src, tr):
-                            memo[_norm(src)] = tr
+                    # 只有明显看起来“翻译成功”的结果才写入缓存
+                    if _looks_translated(src, tr):
+                        memo[key] = tr
+
                 return outs
 
             if inplace:
