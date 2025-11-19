@@ -2,7 +2,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Iterable
 from openai import OpenAI
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, NavigableString
 import logging
 from datetime import datetime
 import json
@@ -141,7 +141,6 @@ from .immersion import (
     inject_bilingual_html_linewise,
     translate_html_inplace,
 )
-
 
 DEFAULT_SUMMARY_FOLDERS = [
     "其他文件夹/Nature","其他文件夹/APS Extended","其他文件夹/PNAS","其他文件夹/Science",
@@ -394,6 +393,76 @@ DEFAULT_TRANSLATE_FOLDERS = [
     "ES","NLDyna","JSV","IJIE","OceanEng","Def. Technol.","Eur.J.Mech.","CompositeStruct",
 ]
 
+def _fix_repeated_inplace_spans(html: str) -> str:
+    """
+    后置兜底：如果同一封邮件中某段英文在某处已经有 inplace 翻译 span，
+    而在其他位置完全相同的英文后面没有 span，则自动补上同样的 span。
+    """
+    if not html:
+        return html
+    try:
+        soup = BeautifulSoup(html, 'html5lib')
+    except Exception:
+        return html
+
+    # 收集已存在的 “英文 -> 中文” 映射（基于 inplace span 的前一个文本节点）
+    mapping: dict[str, str] = {}
+    for span in soup.find_all('span', attrs={'data-translationmark': 'inplace'}):
+        parent = span.parent
+        if parent is None:
+            continue
+        prev = span.previous_sibling
+        # 向前跳过纯空白
+        while isinstance(prev, NavigableString) and not str(prev).strip():
+            prev = prev.previous_sibling
+        if not isinstance(prev, NavigableString):
+            continue
+        eng = str(prev).strip()
+        zh = (span.string or '').strip()
+        if not eng or not zh:
+            continue
+        if _segment_needs_translation(eng) and _looks_translated(eng, zh):
+            mapping.setdefault(eng, zh)
+
+    if not mapping:
+        return html
+
+    # 第二遍：对所有文本节点，如果完全等于某个英文 key 且后面没有 inplace span，则补上
+    for node in list(soup.descendants):
+        if not isinstance(node, NavigableString):
+            continue
+        eng = str(node).strip()
+        if not eng:
+            continue
+        zh = mapping.get(eng)
+        if not zh:
+            continue
+        # 检查紧随其后的兄弟节点是否已经有 inplace span
+        nxt = node.next_sibling
+        while isinstance(nxt, NavigableString) and not str(nxt).strip():
+            nxt = nxt.next_sibling
+        try:
+            if getattr(nxt, 'get', lambda *a, **k: None)('data-translationmark') == 'inplace':
+                continue
+        except Exception:
+            pass
+        try:
+            span = soup.new_tag('span')
+            span['data-translationmark'] = 'inplace'
+            cls = set(span.get('class', []) or [])
+            cls.add('notranslate')
+            span['class'] = list(cls)
+            span['style'] = 'color:#16a34a;font:inherit;line-height:inherit;'
+            span.string = zh
+            node.insert_after(span)
+        except Exception:
+            continue
+
+    try:
+        return str(soup)
+    except Exception:
+        return html
+
 def qwen_translate_batch(cli: OpenAI, model: str, segments: list[str], timeout: float | int = 15.0) -> list[str]:
     if not segments:
         return []
@@ -441,6 +510,7 @@ def qwen_translate_single(cli: OpenAI, model: str, text: str, timeout: float | i
         logger.info(f"LLM translate single error or timeout: {e}")
         return ''
 
+
 def scan_translate_targets(c, cfg: dict, excluded_prefixes: Iterable[str]):
     translate_cfg = cfg.get('translate', {})
     folders = translate_cfg.get('folders', DEFAULT_TRANSLATE_FOLDERS)
@@ -485,6 +555,7 @@ def scan_translate_targets(c, cfg: dict, excluded_prefixes: Iterable[str]):
             logger.info(f"Detected subject (translate INBOX): {sub} (from={sender}, uid={uid})")
             yield ('INBOX', uid, msg)
 
+
 def translate_job(cfg: dict):
     logger.info("Translate job started")
     imap = cfg['imap']; pref = cfg.get('prefix', {'translate':'[机器翻译]','summarize':'[机器总结]'})
@@ -496,18 +567,19 @@ def translate_job(cfg: dict):
     tcfg = cfg.get('translate', {})
     inplace = bool(tcfg.get('inplace_replace', False))
     strict_line = bool(tcfg.get('strict_line', True))
+    # 当 force_retranslate 为 true 时，会跳过 has_linked_reply 幂等检查，用于重新翻译已有邮件
+    force_retranslate = bool(tcfg.get('force_retranslate', False))
     max_translate_attempts = max(1, int(tcfg.get('max_retry', 3)))
     rpm_limit = int(tcfg.get('rpm_limit', 1000))
     tpm_limit = int(tcfg.get('tpm_limit', 50000))
     max_workers = int(tcfg.get('concurrency', 6))
-    # 主翻译模型（通常是 Qwen），以及可选的 DeepSeek 兜底模型
     if not use_mock:
         sf = llm_cfg.get('siliconflow') or cfg.get('siliconflow2') or cfg.get('siliconflow')
         if not sf:
             raise ValueError('No LLM provider configured for translation')
         cli = new_openai(sf['api_base'], sf['api_key'], timeout=translate_timeout)
         trans_model = llm_cfg.get('translator_model') or (cfg.get('siliconflow2',{}) or {}).get('model') or (sf.get('model')) or 'Qwen/Qwen2.5-7B-Instruct'
-        # 使用 summarize 部分配置的 DeepSeek 模型作为翻译兜底模型；不启用思考，仅作普通翻译调用
+        # 使用 summarize_model 作为 DeepSeek 兜底模型；调用时不启用思考，仅作普通翻译
         fallback_model = llm_cfg.get('summarizer_model') or ''
     else:
         cli = None
@@ -616,7 +688,6 @@ def translate_job(cfg: dict):
                 except Exception:
                     est_tokens = 128
                 try:
-                    # 只有在非 mock 模式下才会定义桶；若因为配置问题缺失，下面 acquire 会被 try/except 吃掉
                     req_bucket.acquire(1.0)
                     tok_bucket.acquire(float(est_tokens))
                 except Exception:
@@ -652,103 +723,109 @@ def translate_job(cfg: dict):
                 mark_seen(c, folder, uid)
                 continue
 
-            # idempotency: skip if already handled
+            # idempotency: skip if already handled（若未开启 force_retranslate）
             orig_msgid = msg.get('Message-ID') or ''
-            if orig_msgid and has_linked_reply(c, folder, orig_msgid, pref.get('translate','[机器翻译]')):
-                logger.info("Skip already translated (idempotent)")
-                mark_seen(c, folder, uid)
-                continue
+            if not force_retranslate:
+                if orig_msgid and has_linked_reply(c, folder, orig_msgid, pref.get('translate','[机器翻译]')):
+                    logger.info("Skip already translated (idempotent)")
+                    mark_seen(c, folder, uid)
+                    continue
 
             # Per-mail memo: reuse successful translations for identical source text
             memo: dict[str, str] = {}
             def _norm(s: str) -> str:
-                """Normalize as a stable cache key: collapse whitespace, keep content."""
                 try:
-                    return " ".join((s or "").split())
+                    return " ".join((s or '').split())
                 except Exception:
-                    return (s or "").strip()
+                    return (s or '').strip()
 
             def memo_translator(batch: list[str]) -> list[str]:
                 """
-                Batch translator with per-mail memoization.
-
-                1) 先用 _norm 归一化文本，如果已经在 memo 里，则直接复用；
-                2) 对于本次调用中尚未缓存的文本：
-                   - 相同的 _norm(s) 只向底层 translator 请求一次（去重）；
-                   - 得到译文后，回填到这一批中所有相同段落；
-                这样可以避免“同一封邮件里相同段落，有的翻译成功、有的失败”。
+                带有“同封邮件内缓存 + 批内统一兜底”的批量翻译器：
+                1）同一封邮件内，相同 _norm(text) 只实际调用一次 translator（去重）；
+                2）如果某个 key 至少有一个位置翻译成功，则同一批次内该 key 的所有位置统一使用该译文，
+                   避免出现“第一处翻译成功，后面相同英文没翻译”的情况。
                 """
                 if not batch:
                     return []
 
-                # 最终输出，与输入 batch 等长
-                outs: list[str] = [""] * len(batch)
+                outs: list[str] = [''] * len(batch)
 
-                # 已知缓存的直接填充，剩余的收集成请求
+                # 构建真正需要调用 translator 的请求列表
                 request_texts: list[str] = []
-                request_kind: list[str] = []          # 'keyed' or 'single'
+                request_kind: list[str] = []      # 'keyed' or 'single'
                 request_key: list[str | None] = []
                 request_single_idx: list[int] = []
 
-                # key -> 对应的所有输出位置索引（同一封邮件内的“相同段落”）
                 key_to_out_indexes: dict[str, list[int]] = {}
-                # key -> 在 request_texts 中的下标，保证每个 key 只翻译一次
                 key_to_req_index: dict[str, int] = {}
 
                 for i, seg in enumerate(batch):
                     k = _norm(seg)
                     if k and k in memo:
-                        # 已有缓存：直接填充
+                        # 已有缓存，直接填充
                         outs[i] = memo[k]
                         continue
-
                     if k:
                         # 归一化后非空：按 key 合并请求
                         if k not in key_to_req_index:
                             key_to_req_index[k] = len(request_texts)
                             request_texts.append(seg)
-                            request_kind.append("keyed")
+                            request_kind.append('keyed')
                             request_key.append(k)
                             request_single_idx.append(-1)
                         key_to_out_indexes.setdefault(k, []).append(i)
                     else:
-                        # 无稳定 key（基本是空白/奇怪片段），逐条请求，不做 memo
+                        # 无稳定 key，则逐条请求，不做 memo
                         request_texts.append(seg)
-                        request_kind.append("single")
+                        request_kind.append('single')
                         request_key.append(None)
                         request_single_idx.append(i)
 
-                # 没有需要翻译的新文本，直接返回缓存结果
                 if not request_texts:
                     return outs
 
-                # 统一调用带重试的底层 translator
+                # 调用带重试 + DeepSeek 兜底的 translator
                 res = translator(request_texts) or []
                 if len(res) < len(request_texts):
-                    res = (res + [""] * len(request_texts))[:len(request_texts)]
+                    res = (res + [''] * len(request_texts))[:len(request_texts)]
 
-                # 将结果分发回各个位置，并在本邮件内建立 memo
+                # 先按请求结果分发，并建立 memo
                 for req_idx, src in enumerate(request_texts):
-                    tr = (res[req_idx] or "").strip()
+                    tr = (res[req_idx] or '').strip()
                     kind = request_kind[req_idx]
                     key = request_key[req_idx]
-
-                    if kind == "single":
+                    if kind == 'single':
                         idx = request_single_idx[req_idx]
                         if idx >= 0:
                             outs[idx] = tr
-                        # 这类通常没有稳定 key，不放入 memo
                         continue
-
-                    # 'keyed'：相同 key 的所有位置共享同一个译文
                     if not key:
                         continue
                     idxs = key_to_out_indexes.get(key, []) or []
                     for idx in idxs:
                         outs[idx] = tr
-                    # 只有明显看起来“翻译成功”的结果才写入缓存
                     if _looks_translated(src, tr):
                         memo[key] = tr
+
+                # 再做一轮批内兜底：同一 key 只要有一处看起来翻译成功，就统一回填到该 key 的所有位置
+                best: dict[str, str] = {}
+                for i, seg in enumerate(batch):
+                    k = _norm(seg)
+                    if not k:
+                        continue
+                    tr = (outs[i] or '').strip()
+                    if _looks_translated(seg, tr):
+                        best.setdefault(k, tr)
+                if best:
+                    for i, seg in enumerate(batch):
+                        k = _norm(seg)
+                        if not k or k not in best:
+                            continue
+                        tr = (outs[i] or '').strip()
+                        if not _looks_translated(seg, tr):
+                            outs[i] = best[k]
+                            memo[k] = best[k]
 
                 return outs
 
@@ -756,12 +833,12 @@ def translate_job(cfg: dict):
                 zh_html = translate_html_inplace(html, memo_translator)
             elif strict_line:
                 zh_html = inject_bilingual_html_linewise(html, memo_translator)
-                # and a block-level pass to catch block-only cases
                 zh_html = inject_bilingual_html_conservative(zh_html or html, memo_translator)
             else:
                 zh_html = inject_bilingual_html(html, memo_translator)
-                # then conservative pass to catch leftovers
                 zh_html = inject_bilingual_html_conservative(zh_html or html, memo_translator)
+            # 最后一层兜底：确保同封邮件内相同英文段落统一附带翻译 span
+            zh_html = _fix_repeated_inplace_spans(zh_html)
             new_subject = f"{pref.get('translate','[机器翻译]')} {sub}"
             out = build_email(new_subject, imap['email'], imap['email'], zh_html, None, in_reply_to=msg.get('Message-ID'))
             append_unseen(c, folder or 'INBOX', out)
