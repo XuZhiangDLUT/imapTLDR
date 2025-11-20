@@ -125,56 +125,115 @@ def append_unseen(client: IMAPClient, folder: str, msg: EmailMessage):
     # Append without \Seen flag
     mid = str(msg.get('Message-ID', '') or '')
     subj = str(msg.get('Subject', '') or '')
+
+    # Try to capture UIDNEXT before APPEND so we can later bound the new UID.
+    uidnext_before: int | None = None
+    try:
+        status_before = client.folder_status(folder, [b'UIDNEXT'])  # type: ignore[arg-type]
+        if isinstance(status_before, dict):
+            nxt = status_before.get(b'UIDNEXT') or status_before.get('UIDNEXT')
+            if isinstance(nxt, int):
+                uidnext_before = nxt
+    except Exception:
+        uidnext_before = None
+
     client.append(folder, msg.as_bytes(), flags=())
+
+    # Capture UIDNEXT after APPEND to detect simple, non-concurrent cases.
+    uidnext_after: int | None = None
+    try:
+        status_after = client.folder_status(folder, [b'UIDNEXT'])  # type: ignore[arg-type]
+        if isinstance(status_after, dict):
+            nxt = status_after.get(b'UIDNEXT') or status_after.get('UIDNEXT')
+            if isinstance(nxt, int):
+                uidnext_after = nxt
+    except Exception:
+        uidnext_after = None
+
     # Enforce UNSEEN for the newly appended message (best-effort, with multiple fallbacks)
     try:
         client.select_folder(folder)
+
+        # Fast path: if UIDNEXT increased by exactly 1, the new UID is uidnext_before.
+        if (
+            isinstance(uidnext_before, int)
+            and isinstance(uidnext_after, int)
+            and uidnext_after == uidnext_before + 1
+        ):
+            try:
+                client.remove_flags([uidnext_before], [b'\\Seen'])
+                logger.info(
+                    f"Enforce UNSEEN on appended mail via UIDNEXT: folder={folder}, uid={uidnext_before}"
+                )
+                return
+            except Exception as e_fast:
+                logger.info(f"UNSEEN enforcement via UIDNEXT failed: {e_fast}")
+
         candidates: list[int] = []
+        # When we have UIDNEXT from before APPEND, new messages must have UID >= this value.
+        uid_lower_bound: int | None = uidnext_before if isinstance(uidnext_before, int) else None
+
+        # 1) Prefer exact Message-ID matches; they are globally unique and safe.
         if mid:
             mids = [mid, mid.strip('<>')]
             for m in mids:
                 try:
-                    u = client.search(['HEADER', 'Message-ID', m])
-                    if u:
-                        candidates.extend(u)
+                    uids = client.search(['HEADER', 'Message-ID', m])
                 except Exception:
-                    pass
-        if not candidates and subj:
-            # Prefer auto-generated header to narrow down
+                    continue
+                if not uids:
+                    continue
+                if uid_lower_bound is not None:
+                    uids = [u for u in uids if isinstance(u, int) and u >= uid_lower_bound]
+                if uids:
+                    candidates.extend(uids)
+
+        # 2) Fallback: narrow by Auto-Submitted header + Subject, but only for recent UIDs.
+        if not candidates and subj and uid_lower_bound is not None:
             try:
                 auto = client.search(['HEADER', 'Auto-Submitted', 'auto-generated'])
             except Exception:
                 auto = []
+            if auto and uid_lower_bound is not None:
+                auto = [u for u in auto if isinstance(u, int) and u >= uid_lower_bound]
             pool = auto[-50:] if len(auto) > 50 else auto
             if pool:
                 data = client.fetch(pool, [b'BODY.PEEK[HEADER]'])
                 for uid in pool:
                     try:
                         hdr = BytesParser(policy=policy.default).parsebytes(data[uid][b'BODY[HEADER]'])
-                        if str(hdr.get('Subject','') or '') == subj:
+                        if str(hdr.get('Subject', '') or '') == subj:
                             candidates.append(uid)
                     except Exception:
                         continue
-            # Fallback to SUBJECT search if still not found
+            # 3) Last resort: SUBJECT search limited to recent UIDs only.
             if not candidates:
                 try:
                     by_sub = client.search(['SUBJECT', subj])
-                    if by_sub:
-                        candidates.extend(by_sub[-1:])  # last one most likely the appended
                 except Exception:
-                    pass
+                    by_sub = []
+                if by_sub and uid_lower_bound is not None:
+                    by_sub = [u for u in by_sub if isinstance(u, int) and u >= uid_lower_bound]
+                if by_sub:
+                    # last one most likely the appended
+                    candidates.extend(by_sub[-1:])
+
         # De-dup and select the most recent UID only to avoid toggling older items
         if candidates:
             try:
                 uniq = sorted({int(u) for u in candidates})
             except Exception:
-                uniq = candidates[-1:]
+                uniq = [int(candidates[-1])] if candidates else []
             target = [uniq[-1]] if uniq else []
             if target:
                 client.remove_flags(target, [b'\\Seen'])
-                logger.info(f"Enforce UNSEEN on appended mail: folder={folder}, uid={target[0]}")
+                logger.info(
+                    f"Enforce UNSEEN on appended mail: folder={folder}, uid={target[0]}"
+                )
         else:
-            logger.info(f"Could not locate appended mail for UNSEEN enforcement: folder={folder}, subject={subj}")
+            logger.info(
+                f"Could not locate appended mail for UNSEEN enforcement: folder={folder}, subject={subj}"
+            )
     except Exception as e:
         # ignore enforcement errors, log for diagnosis
         logger.info(f"UNSEEN enforcement skipped due to error: {e}")

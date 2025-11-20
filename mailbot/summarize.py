@@ -11,6 +11,7 @@ from .imap_client import (
 )
 import logging
 from datetime import datetime
+from pathlib import Path
 from premailer import transform as inline_css
 from .jobs import _save_summary_payload, new_openai, deepseek_summarize
 from .utils import rough_token_count
@@ -42,10 +43,21 @@ def summarize_once(cfg: dict, folder: str | None = None, batch: int = 5):
 
         llm_cfg = cfg.get("llm", {})
         timeout = float(llm_cfg.get("summarize_timeout_seconds", llm_cfg.get("request_timeout_seconds", 15.0)))
-        provider = llm_cfg.get("siliconflow") or cfg.get("siliconflow") or cfg.get("siliconflow2")
+        provider_kind = str(llm_cfg.get("summarizer_provider", "siliconflow")).lower()
+
+        if provider_kind == "gemini":
+            provider = llm_cfg.get("gemini") or cfg.get("gemini") or {}
+        else:
+            provider = llm_cfg.get("siliconflow") or cfg.get("siliconflow2") or cfg.get("siliconflow") or {}
         if not provider:
-            raise ValueError("No LLM provider configured. Set llm.siliconflow or siliconflow in config.json")
-        model = llm_cfg.get("summarizer_model") or provider.get("model") or "deepseek-ai/DeepSeek-V3.2-Exp"
+            raise ValueError("No LLM provider configured for summarization. Set llm.siliconflow or llm.gemini in config.json")
+
+        # For Gemini, prefer the model from its provider; keep summarizer_model for DeepSeek & translation fallback
+        if provider_kind == "gemini":
+            model = provider.get("model") or "gemini-2.5-pro"
+        else:
+            model = llm_cfg.get("summarizer_model") or provider.get("model") or "deepseek-ai/DeepSeek-V3.2-Exp"
+
         enable_thinking = bool(llm_cfg.get("enable_thinking", True))
         thinking_budget = int(llm_cfg.get("thinking_budget", 4096))
         use_mock = bool(llm_cfg.get("mock", False) or cfg.get("test", {}).get("mock_llm", False))

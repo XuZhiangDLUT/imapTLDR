@@ -181,11 +181,41 @@ def new_openai(api_base: str, api_key: str, timeout: float | int = 15.0) -> Open
     return OpenAI(base_url=base, api_key=api_key, timeout=timeout)
 
 
-def deepseek_summarize(cli: OpenAI, model: str, prompt: str, text: str, enable_thinking: bool, thinking_budget: int, timeout: float | int = 15.0, expect_json: bool = False) -> tuple[str, str]:
-    extra = {"enable_thinking": enable_thinking, "thinking_budget": thinking_budget} if enable_thinking else {}
+def deepseek_summarize(
+    cli: OpenAI,
+    model: str,
+    prompt: str,
+    text: str,
+    enable_thinking: bool,
+    thinking_budget: int,
+    timeout: float | int = 15.0,
+    expect_json: bool = False,
+) -> tuple[str, str]:
+    """Generic summarize helper for OpenAI-compatible backends (DeepSeek / Gemini).
+
+    - For DeepSeek-like models, passes `enable_thinking` / `thinking_budget` directly.
+    - For Gemini 2.5 models on x666, maps `thinking_budget` to `generationConfig.thinkingConfig.thinkingBudget`.
+    """
+    extra: dict = {}
+    if enable_thinking:
+        # DeepSeek / SiliconFlow style flags (ignored by Gemini backends).
+        extra["enable_thinking"] = enable_thinking
+        extra["thinking_budget"] = thinking_budget
+        # Gemini thinking config (OpenAI-compatible -> Gemini bridge)
+        if model.startswith("gemini-2.5") or model.startswith("gemini-3") or model.startswith("gemini-"):
+            try:
+                budget = int(thinking_budget)
+            except Exception:
+                budget = -1
+            gen_cfg = extra.get("generationConfig") or {}
+            think_cfg = gen_cfg.get("thinkingConfig") or {}
+            # -1 means dynamic thinking budget per Gemini docs
+            think_cfg["thinkingBudget"] = budget
+            gen_cfg["thinkingConfig"] = think_cfg
+            extra["generationConfig"] = gen_cfg
     if expect_json:
         try:
-            # many OpenAI-compatible providers support JSON mode via response_format
+            # Many OpenAI-compatible providers support JSON mode via response_format
             rf = {"type": "json_object"}
             if extra:
                 extra = {**extra, "response_format": rf}
@@ -195,28 +225,29 @@ def deepseek_summarize(cli: OpenAI, model: str, prompt: str, text: str, enable_t
             pass
     try:
         r = cli.chat.completions.create(
-            model=model, temperature=0.2,
-            messages=[{"role":"system","content":prompt},{"role":"user","content":text}],
+            model=model,
+            temperature=0.2,
+            messages=[{"role": "system", "content": prompt}, {"role": "user", "content": text}],
             extra_body=extra or None,
             timeout=timeout,
         )
         msg = r.choices[0].message
-        content = (getattr(msg, 'content', None) or '')
-        # best-effort extract provider-specific thinking output
-        thinking = ''
+        content = (getattr(msg, "content", None) or "")
+        # best-effort extract provider-specific thinking / reasoning output
+        thinking = ""
         try:
-            if hasattr(msg, 'reasoning_content'):
-                thinking = getattr(msg, 'reasoning_content') or ''
+            if hasattr(msg, "reasoning_content"):
+                thinking = getattr(msg, "reasoning_content") or ""
             else:
-                d = msg.model_dump(exclude_none=True) if hasattr(msg, 'model_dump') else getattr(msg, '__dict__', {})
+                d = msg.model_dump(exclude_none=True) if hasattr(msg, "model_dump") else getattr(msg, "__dict__", {})
                 if isinstance(d, dict):
-                    thinking = d.get('reasoning_content') or d.get('thinking') or ''
+                    thinking = d.get("reasoning_content") or d.get("thinking") or ""
         except Exception:
-            thinking = ''
+            thinking = ""
         return content, thinking
     except Exception as e:
         logger.info(f"LLM summarize error or timeout: {e}")
-        return '(summary timeout or error)', ''
+        return "(summary timeout or error)", ""
 
 
 def summarize_job(cfg: dict):
@@ -226,11 +257,24 @@ def summarize_job(cfg: dict):
 
     llm_cfg = cfg.get('llm', {})
     use_mock = bool(llm_cfg.get('mock', False) or cfg.get('test', {}).get('mock_llm', False))
+    provider_kind = str(llm_cfg.get('summarizer_provider', 'siliconflow')).lower()
+
     if not use_mock:
-        sf = llm_cfg.get('siliconflow') or cfg.get('siliconflow')
+        if provider_kind == 'gemini':
+            provider = llm_cfg.get('gemini') or cfg.get('gemini') or {}
+        else:
+            # Default: reuse SiliconFlow-compatible provider for DeepSeek
+            provider = llm_cfg.get('siliconflow') or cfg.get('siliconflow2') or cfg.get('siliconflow') or {}
+        if not provider:
+            raise ValueError('No LLM provider configured for summarization')
+
         summarize_timeout = float(llm_cfg.get('summarize_timeout_seconds', llm_cfg.get('request_timeout_seconds', 15.0)))
-        cli = new_openai(sf['api_base'], sf['api_key'], timeout=summarize_timeout)
-        model = llm_cfg.get('summarizer_model') or sf.get('model')
+        cli = new_openai(provider['api_base'], provider['api_key'], timeout=summarize_timeout)
+        # For Gemini, prefer model from gemini provider; keep summarizer_model for DeepSeek + translation fallback.
+        if provider_kind == 'gemini':
+            model = provider.get('model') or 'gemini-2.5-pro'
+        else:
+            model = llm_cfg.get('summarizer_model') or provider.get('model') or 'deepseek-ai/DeepSeek-V3.2-Exp'
         enable_thinking = llm_cfg.get('enable_thinking', True)
         thinking_budget = int(llm_cfg.get('thinking_budget', 4096))
     else:
@@ -238,6 +282,7 @@ def summarize_job(cfg: dict):
         model = ''
         enable_thinking = False
         thinking_budget = 0
+
     prompt_path = Path(llm_cfg.get('prompt_file', 'Prompt.txt'))
     prompt = prompt_path.read_text(encoding='utf-8') if prompt_path.exists() else 'Summarize in Chinese.'
 
