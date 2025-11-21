@@ -64,6 +64,14 @@ def summarize_once(cfg: dict, folder: str | None = None, batch: int = 5):
         prompt_path = Path(llm_cfg.get('prompt_file', 'Prompt.txt'))
         prompt = prompt_path.read_text(encoding='utf-8') if prompt_path.exists() else 'Summarize in Chinese.'
         cli = new_openai(provider["api_base"], provider["api_key"], timeout=timeout) if not use_mock else None
+        if not use_mock:
+            # Log which LLM will be used for one-off summarization
+            logger.info(
+                f"Summarize-once LLM configured: provider={provider_kind}, model={model}, "
+                f"enable_thinking={enable_thinking}, thinking_budget={thinking_budget}"
+            )
+        else:
+            logger.info("Summarize-once LLM configured: mock mode enabled (no external LLM calls)")
 
         # create a run file early with meta
         run_start = datetime.now()
@@ -73,6 +81,8 @@ def summarize_once(cfg: dict, folder: str | None = None, batch: int = 5):
             "mode": "once",
             "folder": folder,
             "batch": int(batch),
+             # record which backend is actually used (deepseek / gemini)
+            "provider": provider_kind,
             "model": model,
             "enable_thinking": bool(enable_thinking),
             "mock": bool(use_mock),
@@ -104,18 +114,35 @@ def summarize_once(cfg: dict, folder: str | None = None, batch: int = 5):
             sn_tokens = rough_token_count(snippet)
             logger.info(f"Summarize-once plan: total chars={total_chars}, ~tokens={total_tokens} → snippet chars={sn_chars}, ~tokens={sn_tokens}")
             # call model and record outputs
+            meta_extra: dict = {}
             if use_mock:
-                summ, thinking = LLMClient(provider["api_base"], provider["api_key"], model, timeout=timeout).summarize(snippet, lang="zh-CN"), ''
+                summ, thinking, meta_extra = (
+                    LLMClient(provider["api_base"], provider["api_key"], model, timeout=timeout).summarize(
+                        snippet, lang="zh-CN"
+                    ),
+                    "",
+                    {},
+                )
                 parsed = None
             else:
-                summ, thinking = deepseek_summarize(cli, model, prompt, snippet, enable_thinking, thinking_budget, timeout=timeout, expect_json=True)
+                summ, thinking, meta_extra = deepseek_summarize(
+                    cli,
+                    model,
+                    prompt,
+                    snippet,
+                    enable_thinking,
+                    thinking_budget,
+                    timeout=timeout,
+                    expect_json=True,
+                )
                 try:
                     import json as _json
+
                     parsed = _json.loads(summ)
                 except Exception:
                     parsed = None
             # record single-chunk payload for summarize_once
-            submitted_entries.append({
+            entry: dict = {
                 "job": "summarize_once",
                 "folder": folder,
                 "uid": uid,
@@ -133,7 +160,15 @@ def summarize_once(cfg: dict, folder: str | None = None, batch: int = 5):
                 "answer": summ,
                 "when": datetime.now().isoformat(timespec='seconds'),
                 "mock": bool(use_mock),
-            })
+            }
+            if meta_extra:
+                usage = meta_extra.get("usage")
+                if usage is not None:
+                    entry["usage"] = usage
+                for key in ("prompt_tokens", "completion_tokens", "total_tokens", "reasoning_tokens", "completion_id"):
+                    if key in meta_extra and meta_extra[key] is not None:
+                        entry[key] = meta_extra[key]
+            submitted_entries.append(entry)
             # prefer JSON → render cards; else keep raw summary
             if parsed and isinstance(parsed.get("articles"), list):
                 cards = []

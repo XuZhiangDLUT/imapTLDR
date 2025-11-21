@@ -33,7 +33,7 @@ def main() -> None:
     prompt = "You are a helpful assistant. Answer in concise Chinese bullet points."
     text = "请用 3 条要点总结一下牛顿三大定律，各用一句话说明。"
 
-    content, thinking = deepseek_summarize(
+    content, thinking, meta = deepseek_summarize(
         cli,
         model,
         prompt,
@@ -48,6 +48,12 @@ def main() -> None:
     print("[ANSWER]\n", (content or "").strip())
     if thinking:
         print("\n[THINKING] (truncated)\n", str(thinking)[:800])
+    if meta:
+        usage = meta.get("usage") or {}
+        if usage:
+            print("\n[USAGE]", {k: usage.get(k) for k in ("prompt_tokens", "completion_tokens", "total_tokens")})
+        if "reasoning_tokens" in meta:
+            print("[REASONING TOKENS]", meta.get("reasoning_tokens"))
 
 
 if __name__ == "__main__":

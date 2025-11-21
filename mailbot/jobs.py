@@ -190,13 +190,17 @@ def deepseek_summarize(
     thinking_budget: int,
     timeout: float | int = 15.0,
     expect_json: bool = False,
-) -> tuple[str, str]:
+) -> tuple[str, str, dict]:
     """Generic summarize helper for OpenAI-compatible backends (DeepSeek / Gemini).
+
+    Returns (content, thinking, meta) where meta best-effort captures provider
+    specific fields (e.g. usage, reasoning token counts) for JSON logging.
 
     - For DeepSeek-like models, passes `enable_thinking` / `thinking_budget` directly.
     - For Gemini 2.5 models on x666, maps `thinking_budget` to `generationConfig.thinkingConfig.thinkingBudget`.
     """
     extra: dict = {}
+    meta: dict = {}
     if enable_thinking:
         # DeepSeek / SiliconFlow style flags (ignored by Gemini backends).
         extra["enable_thinking"] = enable_thinking
@@ -233,21 +237,63 @@ def deepseek_summarize(
         )
         msg = r.choices[0].message
         content = (getattr(msg, "content", None) or "")
+
         # best-effort extract provider-specific thinking / reasoning output
         thinking = ""
         try:
             if hasattr(msg, "reasoning_content"):
                 thinking = getattr(msg, "reasoning_content") or ""
             else:
-                d = msg.model_dump(exclude_none=True) if hasattr(msg, "model_dump") else getattr(msg, "__dict__", {})
+                d = msg.model_dump(exclude_none=True) if hasattr(msg, "model_dump") else getattr(
+                    msg, "__dict__", {}
+                ) or {}
                 if isinstance(d, dict):
                     thinking = d.get("reasoning_content") or d.get("thinking") or ""
         except Exception:
             thinking = ""
-        return content, thinking
+
+        # capture provider usage / reasoning token stats when available
+        try:
+            usage = getattr(r, "usage", None)
+            if usage is not None:
+                if hasattr(usage, "model_dump"):
+                    u = usage.model_dump(exclude_none=True)
+                else:
+                    u = getattr(usage, "__dict__", {}) or {}
+                if isinstance(u, dict):
+                    meta["usage"] = u
+                    # Flatten common token counters for easier inspection
+                    for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
+                        val = u.get(key)
+                        if val is not None:
+                            try:
+                                meta[key] = int(val)
+                            except Exception:
+                                meta[key] = val
+                    ctd = u.get("completion_tokens_details") or {}
+                    if isinstance(ctd, dict):
+                        rt = ctd.get("reasoning_tokens")
+                        if rt is not None:
+                            try:
+                                meta["reasoning_tokens"] = int(rt)
+                            except Exception:
+                                meta["reasoning_tokens"] = rt
+        except Exception:
+            # usage metadata is optional; swallow all errors here
+            pass
+
+        # also capture top-level completion id if present
+        try:
+            cid = getattr(r, "id", None)
+            if cid:
+                meta["completion_id"] = cid
+        except Exception:
+            pass
+
+        return content, thinking, meta
     except Exception as e:
         logger.info(f"LLM summarize error or timeout: {e}")
-        return "(summary timeout or error)", ""
+        return "(summary timeout or error)", "", meta
 
 
 def summarize_job(cfg: dict):
@@ -277,11 +323,17 @@ def summarize_job(cfg: dict):
             model = llm_cfg.get('summarizer_model') or provider.get('model') or 'deepseek-ai/DeepSeek-V3.2-Exp'
         enable_thinking = llm_cfg.get('enable_thinking', True)
         thinking_budget = int(llm_cfg.get('thinking_budget', 4096))
+        # Log which LLM will be used for machine summarization
+        logger.info(
+            f"Summarize LLM configured: provider={provider_kind}, model={model}, "
+            f"enable_thinking={enable_thinking}, thinking_budget={thinking_budget}"
+        )
     else:
         cli = None
         model = ''
         enable_thinking = False
         thinking_budget = 0
+        logger.info("Summarize LLM configured: mock mode enabled (no external LLM calls)")
 
     prompt_path = Path(llm_cfg.get('prompt_file', 'Prompt.txt'))
     prompt = prompt_path.read_text(encoding='utf-8') if prompt_path.exists() else 'Summarize in Chinese.'
@@ -302,6 +354,7 @@ def summarize_job(cfg: dict):
         'batch_size': batch_size,
         'chunk_chars': chunk_chars,
         'model': model,
+        'provider': provider_kind,
         'enable_thinking': bool(enable_thinking),
         'mock': bool(use_mock),
         'start_time': _run_start.isoformat(timespec='seconds'),
@@ -346,11 +399,21 @@ def summarize_job(cfg: dict):
                     c_chars = len(ch)
                     c_tokens = rough_token_count(ch)
                     logger.info(f"Chunk {idx+1}/{len(chunks)}: chars={c_chars}, ~tokens={c_tokens}")
+                    meta_extra: dict = {}
                     if use_mock:
-                        summary, thinking = summarize_mock(ch), ''
+                        summary, thinking, meta_extra = summarize_mock(ch), '', {}
                         parsed = None
                     else:
-                        summary, thinking = deepseek_summarize(cli, model, prompt, ch, enable_thinking, thinking_budget, timeout=summarize_timeout, expect_json=True)
+                        summary, thinking, meta_extra = deepseek_summarize(
+                            cli,
+                            model,
+                            prompt,
+                            ch,
+                            enable_thinking,
+                            thinking_budget,
+                            timeout=summarize_timeout,
+                            expect_json=True,
+                        )
                         # try parse json articles
                         parsed = None
                         try:
@@ -359,7 +422,7 @@ def summarize_job(cfg: dict):
                         except Exception:
                             parsed = None
                     # record payload + model outputs
-                    submitted_entries.append({
+                    entry: dict = {
                         'job': 'summarize',
                         'folder': folder,
                         'uid': uid,
@@ -377,7 +440,16 @@ def summarize_job(cfg: dict):
                         'answer': summary,
                         'when': datetime.now().isoformat(timespec='seconds'),
                         'mock': bool(use_mock),
-                    })
+                    }
+                    # enrich with provider metadata when available (e.g. Gemini reasoning tokens)
+                    if meta_extra:
+                        usage = meta_extra.get("usage")
+                        if usage is not None:
+                            entry["usage"] = usage
+                        for key in ("prompt_tokens", "completion_tokens", "total_tokens", "reasoning_tokens", "completion_id"):
+                            if key in meta_extra and meta_extra[key] is not None:
+                                entry[key] = meta_extra[key]
+                    submitted_entries.append(entry)
                     if parsed and isinstance(parsed.get('articles'), list):
                         # accumulate articles for this message
                         aggregated_articles.extend([a for a in parsed['articles'] if isinstance(a, dict)])
@@ -626,10 +698,16 @@ def translate_job(cfg: dict):
         trans_model = llm_cfg.get('translator_model') or (cfg.get('siliconflow2',{}) or {}).get('model') or (sf.get('model')) or 'Qwen/Qwen2.5-7B-Instruct'
         # 使用 summarize_model 作为 DeepSeek 兜底模型；调用时不启用思考，仅作普通翻译
         fallback_model = llm_cfg.get('summarizer_model') or ''
+        # 日志中明确当前翻译使用的主模型和兜底模型
+        logger.info(
+            f"Translate LLM configured: primary_model={trans_model}, provider=siliconflow, "
+            f"fallback_model={fallback_model or '(none)'}"
+        )
     else:
         cli = None
         trans_model = ''
         fallback_model = ''
+        logger.info("Translate LLM configured: mock mode enabled (no external LLM calls)")
 
     if use_mock:
         def _base_translator(batch: list[str]) -> list[str]:

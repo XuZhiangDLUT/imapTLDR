@@ -49,10 +49,10 @@
                                "api_key":  "YOUR_X666_API_KEY",
                                "model":  "gemini-2.5-pro"
                            },
-                "summarizer_provider":  "siliconflow",
+                "summarizer_provider":  "gemini",
                 "summarizer_model":  "deepseek-ai/DeepSeek-V3.2-Exp",
                 "enable_thinking":  true,
-                "thinking_budget":  4096,
+                "thinking_budget":  -1,
                 "prompt_file":  "Prompt.txt",
                 "request_timeout_seconds":  300,
                 "summarize_timeout_seconds":  15,
