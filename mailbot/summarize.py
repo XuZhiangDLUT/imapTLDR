@@ -185,7 +185,12 @@ def summarize_once(cfg: dict, folder: str | None = None, batch: int = 5):
                 cards.append(card)
                 rendered = ''.join(cards)
                 if not rendered:
-                    rendered = "<div style=\"color:#888;\">没有相关内容</div>"
+                    # 当没有任何相关文章时，优先展示模型给出的原因说明
+                    reason = (parsed.get("no_match_reason") or "").strip() if isinstance(parsed, dict) else ""
+                    if reason:
+                        rendered = f"<div style=\"color:#888;\">{reason}</div>"
+                    else:
+                        rendered = "<div style=\"color:#888;\">本次 Alert 中的论文与当前研究方向相关性较低，未推荐具体文章。</div>"
                 items.append((msg, rendered))
             else:
                 items.append((msg, summ))

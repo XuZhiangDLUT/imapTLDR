@@ -453,6 +453,10 @@ def summarize_job(cfg: dict):
                     if parsed and isinstance(parsed.get('articles'), list):
                         # accumulate articles for this message
                         aggregated_articles.extend([a for a in parsed['articles'] if isinstance(a, dict)])
+                        # allow模型在无相关文章时给出整体原因说明
+                        reason = (parsed.get('no_match_reason') or "").strip()
+                        if reason:
+                            answers_texts.append(reason)
                     else:
                         answers_texts.append(summary)
                 # prefer JSON-rendered cards when available
@@ -472,7 +476,7 @@ def summarize_job(cfg: dict):
                 else:
                     _txt = ('\n\n'.join(answers_texts)).strip()
                     if not _txt:
-                        _txt = "<div style=\"color:#888;\">没有相关内容</div>"
+                        _txt = "<div style=\"color:#888;\">本次 Alert 中的论文与当前研究方向相关性较低，未推荐具体文章。</div>"
                     pairs.append((uid, msg, _txt))
 
             for i in range(0, len(pairs), batch_size):
