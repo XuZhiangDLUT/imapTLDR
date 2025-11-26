@@ -19,8 +19,9 @@ import textwrap
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from urllib.parse import parse_qs, urlparse
 
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, NavigableString
 from playwright.sync_api import (  # type: ignore
     TimeoutError as PlaywrightTimeoutError,
     sync_playwright,
@@ -97,6 +98,12 @@ def _html_to_text(html: str, limit: int = 20000) -> str:
     soup = BeautifulSoup(html, "html.parser")
     for tag in soup.find_all(["script", "style", "noscript"]):
         tag.decompose()
+    for a in soup.find_all("a"):
+        href = (a.get("href") or "").strip()
+        if not href or not href.lower().startswith("http"):
+            continue
+        marker = NavigableString(f" ({href}) ")
+        a.append(marker)
     text = soup.get_text("\n", strip=True)
     return _clean_lines(text, limit=limit)
 
@@ -244,10 +251,16 @@ class PageFetcher:
         page = self._page
         page.goto(url, wait_until="domcontentloaded")
         page.wait_for_timeout(self.extra_wait_ms)
+        final_url = page.url
+        redirected = self._detect_embedded_redirect(final_url)
+        if redirected and redirected != final_url:
+            logger.info("Following embedded redirect to %s", redirected)
+            page.goto(redirected, wait_until="domcontentloaded")
+            page.wait_for_timeout(self.extra_wait_ms)
+            final_url = page.url
         html = page.content()
         text = _html_to_text(html, limit=16000)
         title = page.title()
-        final_url = page.url
         return {
             "url": url,
             "final_url": final_url,
@@ -255,6 +268,32 @@ class PageFetcher:
             "text": text,
             "html": html,
         }
+
+    def _detect_embedded_redirect(self, final_url: str) -> str | None:
+        try:
+            parsed = urlparse(final_url)
+        except Exception:
+            return None
+        netloc = parsed.netloc.lower()
+        if "scholar.google" in netloc and parsed.path.endswith("scholar_url"):
+            qs = parse_qs(parsed.query or "")
+            targets = qs.get("url") or []
+            if targets:
+                return self._normalize_target_url(targets[0])
+        return None
+
+    def _normalize_target_url(self, url: str) -> str:
+        try:
+            parsed = urlparse(url)
+        except Exception:
+            return url
+        netloc = parsed.netloc.lower()
+        path = parsed.path
+        if "arxiv.org" in netloc and "/pdf/" in path:
+            slug = path.split("/pdf/", 1)[1]
+            slug = slug.replace(".pdf", "")
+            return f"https://arxiv.org/abs/{slug}"
+        return url
 
 
 def extract_abstract_from_page(g: GeminiClient, page_payload: dict) -> dict:
