@@ -4,3 +4,4 @@ premailer
 openai
 lxml
 html5lib
+playwright

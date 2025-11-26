@@ -32,9 +32,9 @@ def _save_summary_payload(entries: list[dict], path: Path | None = None, meta: d
     payload = {"meta": meta or {}, "entries": entries or []}
     try:
         path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding='utf-8')
-        logger.info(f"Saved summarize payloads -> {path}")
+        logger.info(f"已保存本次机器总结的请求与结果到文件: {path}")
     except Exception as e:
-        logger.info(f"Failed to save summarize payloads: {e}")
+        logger.info(f"保存机器总结 payload 文件失败: {e}")
 
 
 def _render_summary_html(items: list[tuple[object, str]], folder: str) -> str:
@@ -177,7 +177,7 @@ def new_openai(api_base: str, api_key: str, timeout: float | int = 15.0) -> Open
     base = api_base.rstrip('/')
     if not base.endswith('/v1'):
         base += '/v1'
-    logger.info(f"Initialize LLM client base={base}")
+    logger.info(f"初始化 LLM 客户端: base={base}")
     return OpenAI(base_url=base, api_key=api_key, timeout=timeout)
 
 
@@ -292,12 +292,11 @@ def deepseek_summarize(
 
         return content, thinking, meta
     except Exception as e:
-        logger.info(f"LLM summarize error or timeout: {e}")
+        logger.info(f"LLM 总结调用出错或超时: {e}")
         return "(summary timeout or error)", "", meta
 
 
 def summarize_job(cfg: dict):
-    logger.info("Summarize job started")
     imap = cfg['imap']; pref = cfg.get('prefix', {'translate':'[机器翻译]','summarize':'[机器总结]'})
     excluded = [pref.get('translate','[机器翻译]'), pref.get('summarize','[机器总结]')]
 
@@ -324,19 +323,24 @@ def summarize_job(cfg: dict):
         enable_thinking = llm_cfg.get('enable_thinking', True)
         thinking_budget = int(llm_cfg.get('thinking_budget', 4096))
         # Log which LLM will be used for machine summarization
+        thinking_mode = "关闭" if not enable_thinking else "开启"
+        if enable_thinking:
+            thinking_budget_desc = "自动" if thinking_budget < 0 else str(thinking_budget)
+        else:
+            thinking_budget_desc = "N/A"
         logger.info(
-            f"Summarize LLM configured: provider={provider_kind}, model={model}, "
-            f"enable_thinking={enable_thinking}, thinking_budget={thinking_budget}"
+            f"机器总结 LLM 配置: 提供商={provider_kind}, 模型={model}, "
+            f"思考模式={thinking_mode}, 思考 token 上限={thinking_budget_desc}"
         )
     else:
         cli = None
         model = ''
         enable_thinking = False
         thinking_budget = 0
-        logger.info("Summarize LLM configured: mock mode enabled (no external LLM calls)")
+        logger.info("机器总结 LLM: 启用 mock 模式（不调用外部 LLM 接口）")
 
     prompt_path = Path(llm_cfg.get('prompt_file', 'Prompt.txt'))
-    prompt = prompt_path.read_text(encoding='utf-8') if prompt_path.exists() else 'Summarize in Chinese.'
+    prompt = prompt_path.read_text(encoding='utf-8') if prompt_path.exists() else '请用中文进行总结，并给出结构化要点。'
 
     folders = cfg.get('summarize', {}).get('folders', DEFAULT_SUMMARY_FOLDERS)
     batch_size = int(cfg.get('summarize', {}).get('batch_size', 10))
@@ -364,18 +368,18 @@ def summarize_job(cfg: dict):
     _save_summary_payload([], path=_run_path, meta=_meta)
     try:
         for folder in folders:
-            logger.info(f"Scanning folder (summarize): {folder}")
+            logger.info(f"扫描总结文件夹: {folder}")
             # robust unseen enumeration to avoid server SEARCH limits
             fetch_chunk = int(cfg.get('summarize', {}).get('unseen_fetch_chunk', 500))
             uids = search_unseen_without_prefix(c, folder, exclude_auto_generated=True, robust=True, fetch_chunk=fetch_chunk)
-            logger.info(f"Found UNSEEN (robust, auto-generated excluded): {len(uids)}")
+            logger.info(f"找到未读邮件（已排除自动通知），数量={len(uids)}")
             # Optional cap per folder
             cfg_sum = cfg.get('summarize', {})
             max_per = int(cfg_sum.get('max_unseen_per_run_per_folder', 0) or 0)
             order = str(cfg_sum.get('scan_order', 'newest')).lower()
             if max_per > 0 and len(uids) > max_per:
                 uids = uids[-max_per:] if order == 'newest' else uids[:max_per]
-                logger.info(f"Apply cap: take {len(uids)} ({order})")
+                logger.info(f"命中数量超过每个文件夹上限，按 {order} 方向截断到 {len(uids)} 封")
             pairs = []
             for uid in uids:
                 raw = fetch_raw(c, uid)
@@ -383,7 +387,7 @@ def summarize_job(cfg: dict):
                 sub = decode_subject(msg)
                 if not pass_prefix(sub, excluded):
                     continue
-                logger.info(f"Detected subject (summarize): {sub} (uid={uid})")
+                logger.info(f"待总结邮件: {sub} (uid={uid})")
                 html, txt = pick_html_or_text(msg)
                 plain = BeautifulSoup(html, 'html5lib').get_text('\n', strip=True) if html else (txt or '')
                 if not plain:
@@ -392,13 +396,18 @@ def summarize_job(cfg: dict):
                 total_chars = len(plain)
                 total_tokens = rough_token_count(plain)
                 chunks = split_by_chars(plain, chunk_chars)
-                logger.info(f"Summarize plan: chars={total_chars}, ~tokens={total_tokens}, chunks={len(chunks)} x <= {chunk_chars} chars")
+                logger.info(
+                    f"总结规划: 原文字符数={total_chars}, 预估 tokens={total_tokens}, "
+                    f"拆分为 {len(chunks)} 段（每段最多 {chunk_chars} 字符）"
+                )
                 answers_texts: list[str] = []
                 aggregated_articles: list[dict] = []
                 for idx, ch in enumerate(chunks):
                     c_chars = len(ch)
                     c_tokens = rough_token_count(ch)
-                    logger.info(f"Chunk {idx+1}/{len(chunks)}: chars={c_chars}, ~tokens={c_tokens}")
+                    logger.info(
+                        f"分段 {idx+1}/{len(chunks)}: 字符数={c_chars}, 预估 tokens={c_tokens}"
+                    )
                     meta_extra: dict = {}
                     if use_mock:
                         summary, thinking, meta_extra = summarize_mock(ch), '', {}
@@ -503,7 +512,6 @@ def summarize_job(cfg: dict):
     _meta['entries_written'] = len(submitted_entries)
     _meta['end_time'] = datetime.now().isoformat(timespec='seconds')
     _save_summary_payload(submitted_entries, path=_run_path, meta=_meta)
-    logger.info("Summarize job finished")
 
 
 # --- Translation (ported minimal from imapTLDR2) ---
@@ -642,10 +650,10 @@ def scan_translate_targets(c, cfg: dict, excluded_prefixes: Iterable[str]):
         # QQ 邮箱其他文件夹通常以“其他文件夹/xxx”，保持与 summarize 同一前缀
         target_folder = folder if (folder.startswith('INBOX') or '/' in folder) else f"其他文件夹/{folder}"
         try:
-            logger.info(f"Scanning folder: {target_folder}")
+            logger.info(f"扫描翻译文件夹: {target_folder}")
             uids = list_unseen(c, target_folder)
         except Exception as e:
-            logger.info(f"Skip folder (not exist): {target_folder} ({e})")
+            logger.info(f"跳过文件夹（不存在或无法访问）: {target_folder} ({e})")
             continue
         count = 0
         for uid in uids:
@@ -654,7 +662,7 @@ def scan_translate_targets(c, cfg: dict, excluded_prefixes: Iterable[str]):
             sub = decode_subject(msg)
             if not pass_prefix(sub, excluded_prefixes):
                 continue
-            logger.info(f"Detected subject (translate): {sub} (uid={uid})")
+            logger.info(f"待翻译邮件: {sub} (uid={uid})")
             yield (target_folder, uid, msg)
             count += 1
             if count >= max_per:
@@ -664,7 +672,7 @@ def scan_translate_targets(c, cfg: dict, excluded_prefixes: Iterable[str]):
     inbox_keywords = translate_cfg.get('inbox_keywords', ["相关研究汇总","快讯汇总"])  # defaults
     inbox_froms = translate_cfg.get('inbox_from', ["scholaralerts-noreply@google.com"]) 
     uids = list_unseen(c, 'INBOX')
-    logger.info("Scanning folder: INBOX (keyword channel)")
+    logger.info("扫描 INBOX 关键字通道")
     for uid in uids:
         raw = fetch_raw(c, uid)
         msg = parse_message(raw)
@@ -673,12 +681,11 @@ def scan_translate_targets(c, cfg: dict, excluded_prefixes: Iterable[str]):
             continue
         sender = str(msg.get('From', ''))
         if any(k in sub for k in inbox_keywords) or any(f in sender for f in inbox_froms):
-            logger.info(f"Detected subject (translate INBOX): {sub} (from={sender}, uid={uid})")
+            logger.info(f"INBOX 关键字命中: {sub} (from={sender}, uid={uid})")
             yield ('INBOX', uid, msg)
 
 
 def translate_job(cfg: dict):
-    logger.info("Translate job started")
     imap = cfg['imap']; pref = cfg.get('prefix', {'translate':'[机器翻译]','summarize':'[机器总结]'})
     excluded = [pref.get('translate','[机器翻译]'), pref.get('summarize','[机器总结]')]
 
@@ -704,14 +711,14 @@ def translate_job(cfg: dict):
         fallback_model = llm_cfg.get('summarizer_model') or ''
         # 日志中明确当前翻译使用的主模型和兜底模型
         logger.info(
-            f"Translate LLM configured: primary_model={trans_model}, provider=siliconflow, "
-            f"fallback_model={fallback_model or '(none)'}"
+            f"机器翻译 LLM 配置: 主模型={trans_model}, 提供商=siliconflow, "
+            f"兜底模型={fallback_model or '(none)'}"
         )
     else:
         cli = None
         trans_model = ''
         fallback_model = ''
-        logger.info("Translate LLM configured: mock mode enabled (no external LLM calls)")
+        logger.info("机器翻译 LLM: 启用 mock 模式（不调用外部 LLM 接口）")
 
     if use_mock:
         def _base_translator(batch: list[str]) -> list[str]:
@@ -771,7 +778,7 @@ def translate_job(cfg: dict):
                         outs[i] = (res or '').strip()
                     except Exception as e:
                         # fill empty on failure for this segment
-                        logger.info(f"translate future failed: {e}")
+                        logger.info(f"翻译子任务失败，将填充为空字符串: {e}")
             return outs
 
     def translator(batch: list[str]) -> list[str]:
@@ -787,7 +794,7 @@ def translate_job(cfg: dict):
             try:
                 results = _base_translator(sub_batch) or []
             except Exception as exc:
-                logger.warning(f"translate batch attempt {attempt} raised error: {exc}")
+                logger.warning(f"翻译批次第 {attempt} 次尝试发生异常: {exc}")
                 results = [''] * len(sub_batch)
             if len(results) < len(sub_batch):
                 # pad to align indexes
@@ -797,7 +804,7 @@ def translate_job(cfg: dict):
             pending = [idx for idx in pending if not _looks_translated(batch[idx], outs[idx])]
             if pending and attempt < max_translate_attempts:
                 logger.warning(
-                    f"translate retry {attempt}/{max_translate_attempts} scheduled for {len(pending)} segments"
+                    f"翻译重试 {attempt}/{max_translate_attempts}，剩余 {len(pending)} 个片段待处理"
                 )
 
         # 对仍然不合格的段落，使用 DeepSeek（summarizer_model）兜底翻译一次，不启用思考
@@ -976,4 +983,3 @@ def translate_job(cfg: dict):
             c.logout()
         except Exception:
             pass
-    logger.info("Translate job finished")
