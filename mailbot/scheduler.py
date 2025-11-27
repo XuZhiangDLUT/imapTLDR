@@ -406,7 +406,16 @@ def start_scheduler():
         when_s = when.strftime("%Y-%m-%d %H:%M:%S %Z") if when else "N/A"
         logger.info(f"NEXT 下次运行时间 {when_s} -> {j.id}")
 
-    sch.start()
+    try:
+        # BlockingScheduler will swallow KeyboardInterrupt and perform graceful shutdown
+        # (wait=True). To allow immediate exit on Ctrl+C, catch here and stop without waiting.
+        sch.start()
+    except KeyboardInterrupt:
+        logger.info("WARN 收到 Ctrl+C，立即停止调度器（不等待当前任务完成）")
+        try:
+            sch.shutdown(wait=False)
+        except Exception:
+            pass
 
 
 if __name__ == '__main__':
