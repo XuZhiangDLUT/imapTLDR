@@ -35,7 +35,8 @@
                       "unseen_fetch_chunk":  500,
                       "max_unseen_per_run_per_folder":  0,
                       "scan_order":  "newest",
-                      "follow_translate_interval":  true
+                      "follow_translate_interval":  true,
+                      "save_summary_json":  true
                   },
     "llm":  {
                 "mock":  true,

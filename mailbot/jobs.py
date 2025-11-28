@@ -299,6 +299,8 @@ def deepseek_summarize(
 def summarize_job(cfg: dict):
     imap = cfg['imap']; pref = cfg.get('prefix', {'translate':'[机器翻译]','summarize':'[机器总结]'})
     excluded = [pref.get('translate','[机器翻译]'), pref.get('summarize','[机器总结]')]
+    sum_cfg = cfg.get('summarize', {})
+    save_summary_json = bool(sum_cfg.get('save_summary_json', True))
 
     llm_cfg = cfg.get('llm', {})
     use_mock = bool(llm_cfg.get('mock', False) or cfg.get('test', {}).get('mock_llm', False))
@@ -342,16 +344,16 @@ def summarize_job(cfg: dict):
     prompt_path = Path(llm_cfg.get('prompt_file', 'Prompt.txt'))
     prompt = prompt_path.read_text(encoding='utf-8') if prompt_path.exists() else '请用中文进行总结，并给出结构化要点。'
 
-    folders = cfg.get('summarize', {}).get('folders', DEFAULT_SUMMARY_FOLDERS)
-    batch_size = int(cfg.get('summarize', {}).get('batch_size', 10))
-    chunk_chars = int(cfg.get('summarize', {}).get('chunk_tokens', 16000))  # approx by chars
+    folders = sum_cfg.get('folders', DEFAULT_SUMMARY_FOLDERS)
+    batch_size = int(sum_cfg.get('batch_size', 10))
+    chunk_chars = int(sum_cfg.get('chunk_tokens', 16000))  # approx by chars
 
     c = connect(imap['server'], imap['email'], imap['password'], port=imap.get('port',993), ssl=imap.get('ssl',True))
     submitted_entries: list[dict] = []
     # create a run file early with meta for visibility
     _run_start = datetime.now()
     _run_ts = _run_start.strftime('%Y%m%d-%H%M%S')
-    _run_path = _DATA_DIR / f'summarize-{_run_ts}.json'
+    _run_path = (_DATA_DIR / f'summarize-{_run_ts}.json') if save_summary_json else None
     _meta = {
         'mode': 'job',
         'folders': folders,
@@ -365,16 +367,20 @@ def summarize_job(cfg: dict):
         'run_id': _run_ts,
         'entries_written': 0,
     }
-    _save_summary_payload([], path=_run_path, meta=_meta)
+    def _maybe_save(entries: list[dict]):
+        if save_summary_json and _run_path:
+            _save_summary_payload(entries, path=_run_path, meta=_meta)
+
+    _maybe_save([])
     try:
         for folder in folders:
             logger.info(f"扫描总结文件夹: {folder}")
             # robust unseen enumeration to avoid server SEARCH limits
-            fetch_chunk = int(cfg.get('summarize', {}).get('unseen_fetch_chunk', 500))
+            fetch_chunk = int(sum_cfg.get('unseen_fetch_chunk', 500))
             uids = search_unseen_without_prefix(c, folder, exclude_auto_generated=True, robust=True, fetch_chunk=fetch_chunk)
             logger.info(f"找到未读邮件（已排除自动通知），数量={len(uids)}")
             # Optional cap per folder
-            cfg_sum = cfg.get('summarize', {})
+            cfg_sum = sum_cfg
             max_per = int(cfg_sum.get('max_unseen_per_run_per_folder', 0) or 0)
             order = str(cfg_sum.get('scan_order', 'newest')).lower()
             if max_per > 0 and len(uids) > max_per:
@@ -502,7 +508,7 @@ def summarize_job(cfg: dict):
                 # checkpoint after each batch
                 _meta['entries_written'] = len(submitted_entries)
                 _meta['last_update'] = datetime.now().isoformat(timespec='seconds')
-                _save_summary_payload(submitted_entries, path=_run_path, meta=_meta)
+                _maybe_save(submitted_entries)
     finally:
         try:
             c.logout()
@@ -511,7 +517,7 @@ def summarize_job(cfg: dict):
     # finalize payloads for this run
     _meta['entries_written'] = len(submitted_entries)
     _meta['end_time'] = datetime.now().isoformat(timespec='seconds')
-    _save_summary_payload(submitted_entries, path=_run_path, meta=_meta)
+    _maybe_save(submitted_entries)
 
 
 # --- Translation (ported minimal from imapTLDR2) ---

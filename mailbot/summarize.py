@@ -23,10 +23,19 @@ def summarize_once(cfg: dict, folder: str | None = None, batch: int = 5):
     imap = cfg["imap"]
     folder = folder or imap.get("folder", "INBOX")
     exclude = [cfg.get("prefix", {}).get("translate", "[机器翻译]"), cfg.get("prefix", {}).get("summarize", "[机器总结]")]
+    sum_cfg = cfg.get("summarize", {})
+    save_summary_json = bool(sum_cfg.get("save_summary_json", True))
     client = connect(imap["server"], imap["email"], imap["password"], port=imap.get("port", 993), ssl=True)
 
     try:
-        uids = search_unseen_without_prefix(client, folder, exclude_prefixes=exclude, exclude_auto_generated=True, robust=True, fetch_chunk=int(cfg.get('summarize', {}).get('unseen_fetch_chunk', 500)))
+        uids = search_unseen_without_prefix(
+            client,
+            folder,
+            exclude_prefixes=exclude,
+            exclude_auto_generated=True,
+            robust=True,
+            fetch_chunk=int(sum_cfg.get('unseen_fetch_chunk', 500)),
+        )
         logger.info(f"Summarize once: scanning folder {folder}, UNSEEN={len(uids)} (robust, auto-generated excluded)")
         # client-side filter to avoid non-ASCII SEARCH
         filtered = []
@@ -76,7 +85,7 @@ def summarize_once(cfg: dict, folder: str | None = None, batch: int = 5):
         # create a run file early with meta
         run_start = datetime.now()
         run_ts = run_start.strftime('%Y%m%d-%H%M%S')
-        run_path = Path(__file__).resolve().parents[1] / 'data' / f'summarize-{run_ts}.json'
+        run_path = (Path(__file__).resolve().parents[1] / 'data' / f'summarize-{run_ts}.json') if save_summary_json else None
         meta = {
             "mode": "once",
             "folder": folder,
@@ -90,11 +99,15 @@ def summarize_once(cfg: dict, folder: str | None = None, batch: int = 5):
             "run_id": run_ts,
             "entries_written": 0,
         }
-        _save_summary_payload([], path=run_path, meta=meta)
+        def _maybe_save(entries: list[dict]):
+            if save_summary_json and run_path:
+                _save_summary_payload(entries, path=run_path, meta=meta)
+
+        _maybe_save([])
 
         if not filtered:
             meta["end_time"] = datetime.now().isoformat(timespec='seconds')
-            _save_summary_payload([], path=run_path, meta=meta)
+            _maybe_save([])
             return None
 
         items = []
@@ -197,10 +210,10 @@ def summarize_once(cfg: dict, folder: str | None = None, batch: int = 5):
             # checkpoint after each item
             meta["entries_written"] = len(submitted_entries)
             meta["last_update"] = datetime.now().isoformat(timespec='seconds')
-            _save_summary_payload(submitted_entries, path=run_path, meta=meta)
+            _maybe_save(submitted_entries)
         if not items:
             meta["end_time"] = datetime.now().isoformat(timespec='seconds')
-            _save_summary_payload(submitted_entries, path=run_path, meta=meta)
+            _maybe_save(submitted_entries)
             return None
 
         def _bullets(text: str) -> str:
@@ -261,7 +274,7 @@ def summarize_once(cfg: dict, folder: str | None = None, batch: int = 5):
             mark_seen(client, folder, uid)
         # persist submitted payloads for this run
         meta["end_time"] = datetime.now().isoformat(timespec='seconds')
-        _save_summary_payload(submitted_entries, path=run_path, meta=meta)
+        _maybe_save(submitted_entries)
         return len(items)
     finally:
         try:
