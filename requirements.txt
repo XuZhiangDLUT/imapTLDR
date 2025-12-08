@@ -5,3 +5,7 @@ openai
 lxml
 html5lib
 playwright
+google-generativeai
+pydantic
+pytz
+apscheduler
