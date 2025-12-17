@@ -11,7 +11,7 @@ from apscheduler.triggers.date import DateTrigger
 from apscheduler.events import EVENT_JOB_MISSED
 
 from .config import load_config
-from .jobs import summarize_job, translate_job
+from .jobs import summarize_job, translate_job, preflight_check_llm
 
 
 logger = logging.getLogger("mailbot")
@@ -293,6 +293,15 @@ def _setup_logging():
 def start_scheduler():
     _setup_logging()
     cfg = load_config()
+
+    # 启动前预检：检查所有 LLM 任务的 API 是否可用
+    logger.info("START 启动前预检...")
+    try:
+        preflight_check_llm(cfg)
+    except Exception as e:
+        logger.error(f"预检失败，调度器无法启动: {e}")
+        raise SystemExit(1)
+
     tzname = cfg.get("timezone", "Asia/Shanghai")
     tz = pytz.timezone(tzname)
 

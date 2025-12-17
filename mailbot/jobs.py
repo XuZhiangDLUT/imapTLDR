@@ -266,6 +266,89 @@ def _build_openai_for_task(task_cfg: dict) -> OpenAI | None:
     return new_openai(str(api_base), str(api_key), timeout=timeout)
 
 
+def preflight_check_llm(cfg: dict) -> bool:
+    """
+    启动时预检：检查 llm.tasks 中配置的各个任务的模型是否都能正常调用 API。
+    发送一个简单的测试消息，验证能否返回响应。
+
+    Returns:
+        True 如果所有任务的 LLM 都能正常调用，否则抛出异常或返回 False。
+    """
+    llm_cfg = cfg.get("llm", {}) or {}
+    tasks_cfg = llm_cfg.get("tasks") or {}
+    use_mock = bool(llm_cfg.get("mock", False) or cfg.get("test", {}).get("mock_llm", False))
+
+    if use_mock:
+        logger.info("LLM 预检: 当前为 mock 模式，跳过 API 连接检查")
+        return True
+
+    if not tasks_cfg:
+        logger.warning("LLM 预检: 未配置任何 llm.tasks，跳过检查")
+        return True
+
+    logger.info(f"LLM 预检: 开始检查 {len(tasks_cfg)} 个任务的 LLM 配置...")
+
+    # 收集需要检查的唯一 (provider, api_base, api_key, model) 组合，避免重复检查
+    checked_combos: set[tuple[str, str, str]] = set()  # (api_base, api_key, model)
+    failed_tasks: list[str] = []
+
+    for task_name in tasks_cfg.keys():
+        # 使用通用的任务配置解析函数
+        task = _get_llm_task_config(
+            cfg,
+            task_name,
+            default_provider="siliconflow",
+            default_model="",
+            global_timeout_key=None,
+            default_timeout=30.0,
+            default_enable_thinking=False,
+            default_thinking_budget=0,
+            default_expect_json=False,
+            default_prompt_file=None,
+        )
+
+        api_base = task.get("api_base") or ""
+        api_key = task.get("api_key") or ""
+        model = task.get("model") or ""
+        provider = task.get("provider") or "unknown"
+
+        if not api_base or not api_key or not model:
+            logger.warning(f"LLM 预检: 任务 '{task_name}' 缺少 api_base/api_key/model，跳过")
+            continue
+
+        combo_key = (api_base, api_key, model)
+        if combo_key in checked_combos:
+            logger.info(f"LLM 预检: 任务 '{task_name}' 与已检查的配置相同，跳过重复检查")
+            continue
+        checked_combos.add(combo_key)
+
+        logger.info(f"LLM 预检: 检查任务 '{task_name}' (provider={provider}, model={model})...")
+
+        try:
+            cli = new_openai(api_base, api_key, timeout=30.0)
+            # 发送一个简单的数学测试请求，验证模型能正常推理并返回内容
+            r = cli.chat.completions.create(
+                model=model,
+                temperature=0.0,
+                messages=[{"role": "user", "content": "请计算 2+3 等于几？只回答数字。"}],
+                max_tokens=16,
+                timeout=30.0,
+            )
+            response_text = (r.choices[0].message.content or "").strip()
+            if not response_text:
+                raise ValueError("模型返回空响应")
+            logger.info(f"LLM 预检: 任务 '{task_name}' 成功 (响应: {response_text[:50]})")
+        except Exception as e:
+            logger.error(f"LLM 预检: 任务 '{task_name}' 失败 - {e}")
+            failed_tasks.append(task_name)
+
+    if failed_tasks:
+        raise RuntimeError(f"LLM 预检失败: 以下任务的 API 无法正常调用: {', '.join(failed_tasks)}")
+
+    logger.info("LLM 预检: 所有任务的 LLM API 检查通过")
+    return True
+
+
 def deepseek_summarize(
     cli: OpenAI,
     model: str,
@@ -408,6 +491,31 @@ def summarize_job(cfg: dict):
     thinking_budget = int(task["thinking_budget"])
     summarize_timeout = float(task["timeout_seconds"] or 15.0)
 
+    # 兜底总结任务配置：当主模型超时或出错时使用
+    fallback_task = _get_llm_task_config(
+        cfg,
+        "summarize_fallback",
+        default_provider=task["provider"],
+        default_model="",
+        global_timeout_key="summarize_timeout_seconds",
+        default_timeout=summarize_timeout,
+        default_enable_thinking=True,
+        default_thinking_budget=8192,
+        default_expect_json=True,
+        default_prompt_file=task.get("prompt_file") or "Prompt.txt",
+    )
+    fallback_model = fallback_task["model"]
+    fallback_cli: OpenAI | None = None
+    fallback_enable_thinking = bool(fallback_task["enable_thinking"])
+    fallback_thinking_budget = int(fallback_task["thinking_budget"])
+    fallback_timeout = float(fallback_task["timeout_seconds"] or summarize_timeout)
+    if fallback_model and not use_mock:
+        try:
+            fallback_cli = _build_openai_for_task(fallback_task)
+        except ValueError:
+            # 若兜底任务缺少凭据，则回退到主客户端 + 模型名
+            fallback_cli = cli
+
     # 日志中明确此次总结任务使用的后端配置
     thinking_mode = "关闭" if not enable_thinking else "开启"
     if enable_thinking:
@@ -419,7 +527,8 @@ def summarize_job(cfg: dict):
     else:
         logger.info(
             f"机器总结 LLM 配置: 提供商={provider_kind}, 模型={model}, "
-            f"思考模式={thinking_mode}, 思考 token 上限={thinking_budget_desc}"
+            f"思考模式={thinking_mode}, 思考 token 上限={thinking_budget_desc}, "
+            f"兜底模型={fallback_model or '(none)'}"
         )
 
     prompt_path = Path(task.get('prompt_file') or 'Prompt.txt')
@@ -496,6 +605,7 @@ def summarize_job(cfg: dict):
                         f"分段 {idx+1}/{len(chunks)}: 字符数={c_chars}, 预估 tokens={c_tokens}"
                     )
                     meta_extra: dict = {}
+                    used_fallback = False
                     if use_mock:
                         summary, thinking, meta_extra = summarize_mock(ch), '', {}
                         parsed = None
@@ -510,6 +620,26 @@ def summarize_job(cfg: dict):
                             timeout=summarize_timeout,
                             expect_json=bool(task.get("expect_json", True)),
                         )
+                        # 检测主模型是否超时或出错，若有 fallback 模型则使用兜底
+                        if "(summary timeout or error)" in summary and fallback_model and fallback_cli:
+                            logger.warning(
+                                f"主模型总结失败，尝试使用兜底模型: {fallback_model}"
+                            )
+                            summary, thinking, meta_extra = deepseek_summarize(
+                                fallback_cli,
+                                fallback_model,
+                                prompt,
+                                ch,
+                                fallback_enable_thinking,
+                                fallback_thinking_budget,
+                                timeout=fallback_timeout,
+                                expect_json=bool(fallback_task.get("expect_json", True)),
+                            )
+                            used_fallback = True
+                            if "(summary timeout or error)" not in summary:
+                                logger.info(f"兜底模型总结成功")
+                            else:
+                                logger.warning(f"兜底模型总结也失败了")
                         # try parse json articles
                         parsed = None
                         try:
@@ -518,6 +648,7 @@ def summarize_job(cfg: dict):
                         except Exception:
                             parsed = None
                     # record payload + model outputs
+                    actual_model = fallback_model if used_fallback else model
                     entry: dict = {
                         'job': 'summarize',
                         'folder': folder,
@@ -529,9 +660,10 @@ def summarize_job(cfg: dict):
                         'chars': c_chars,
                         'approx_tokens': c_tokens,
                         'prompt': prompt,
-                        'model': model,
-                        'enable_thinking': bool(enable_thinking),
-                        'thinking_budget': int(thinking_budget),
+                        'model': actual_model,
+                        'used_fallback': used_fallback,
+                        'enable_thinking': bool(fallback_enable_thinking if used_fallback else enable_thinking),
+                        'thinking_budget': int(fallback_thinking_budget if used_fallback else thinking_budget),
                         'thinking': thinking,
                         'answer': summary,
                         'when': datetime.now().isoformat(timespec='seconds'),
