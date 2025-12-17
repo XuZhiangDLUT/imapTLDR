@@ -1,5 +1,7 @@
 from __future__ import annotations
 import logging
+import os
+import signal
 import threading
 from datetime import datetime, timedelta
 import sys
@@ -518,12 +520,31 @@ def start_scheduler():
         when_s = when.strftime("%Y-%m-%d %H:%M:%S %Z") if when else "N/A"
         logger.info(f"NEXT 下次运行时间 {when_s} -> {j.id}")
 
+    # 设置信号处理器，收到 Ctrl+C 时强制立即退出
+    # APScheduler 的 BlockingScheduler.start() 会吞掉 KeyboardInterrupt 并调用 shutdown(wait=True)
+    # 导致程序无法立即退出，需要用信号处理器强制退出
+    def _force_exit(signum, frame):
+        logger.info("WARN 收到 Ctrl+C，强制退出（不等待当前任务完成）")
+        try:
+            sch.shutdown(wait=False)
+        except Exception:
+            pass
+        # 强制退出进程，不等待线程完成
+        os._exit(0)
+
+    # 注册 SIGINT 处理器（Ctrl+C）
+    signal.signal(signal.SIGINT, _force_exit)
+    # Windows 上 SIGTERM 可能不可用，但尝试注册
     try:
-        # BlockingScheduler will swallow KeyboardInterrupt and perform graceful shutdown
-        # (wait=True). To allow immediate exit on Ctrl+C, catch here and stop without waiting.
+        signal.signal(signal.SIGTERM, _force_exit)
+    except (ValueError, OSError):
+        pass
+
+    try:
         sch.start()
     except KeyboardInterrupt:
-        logger.info("WARN 收到 Ctrl+C，立即停止调度器（不等待当前任务完成）")
+        # 这个分支可能不会被触发（APScheduler 会吞掉），但保留作为后备
+        logger.info("WARN 收到 Ctrl+C，立即停止调度器")
         try:
             sch.shutdown(wait=False)
         except Exception:
