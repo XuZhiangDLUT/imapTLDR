@@ -103,8 +103,8 @@ run.py                   # CLI 入口，支持 summarize / summarize_job
 
 ### `llm`
 - `mock`: true 时使用 `mailbot.mock_llm`，无需真实 API。
-- `siliconflow` / `gemini`: provider 连接信息 + 模型名称。
-- `summarizer_provider`: `"gemini"` 或默认 `"siliconflow"`。
+- `siliconflow` / `bohe`: provider 连接信息 + 模型名称。
+- `summarizer_provider`: `"bohe"` 或默认 `"siliconflow"`。
 - `summarizer_model` / `translator_model`: 深度定制模型。
 - `enable_thinking` / `thinking_budget`: DeepSeek/Gemini Thinking 模式控制。
 - `prompt_file`: 摘要提示词文件（默认 `Prompt.txt`）。
@@ -126,7 +126,7 @@ run.py                   # CLI 入口，支持 summarize / summarize_job
   - 摘要：`data/summarize-*.json` 保存 meta + 每段 chunk 输出，可关闭。
   - 错误：异常会打印堆栈，并继续处理后续邮件。
 - **调试脚本**：
-  - `scripts/test_gemini_x666.py`：验证 Gemini 接口。
+  - `scripts/test_gemini_x666.py`：验证 Bohe/Gemini 接口。
   - `scripts/debug_fetch_emails.py`：快速查看 IMAP 邮件体。
   - `scripts/count_folder_messages.py`：统计文件夹邮件数量。
   - 其余脚本可帮助排查翻译注入、LLM JSON 返回等问题。

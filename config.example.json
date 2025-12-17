@@ -45,11 +45,11 @@
                                     "api_key":  "YOUR_SILICONFLOW_API_KEY",
                                     "model":  "deepseek-ai/DeepSeek-V3.2-Exp"
                                 },
-                "gemini":  {
-                               "api_base":  "https://x666.me",
-                               "api_key":  "YOUR_X666_API_KEY",
-                               "model":  "gemini-2.5-pro"
-                           },
+                "bohe":  {
+                             "api_base":  "https://x666.me",
+                             "api_key":  "YOUR_X666_API_KEY",
+                             "model":  "gemini-2.5-pro"
+                         },
                 "tasks":  {
                               "summarize_job":  {
                                                     "provider":  "siliconflow",

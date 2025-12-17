@@ -20,9 +20,10 @@ def main() -> None:
     cfg_path = Path("config.json")
     cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
     llm = cfg.get("llm", {})
-    gem = llm.get("gemini") or cfg.get("gemini")
+    # Prefer new llm.bohe config, but keep llm.gemini / gemini for backward compatibility
+    gem = llm.get("bohe") or llm.get("gemini") or cfg.get("bohe") or cfg.get("gemini")
     if not gem:
-        raise SystemExit("No llm.gemini config found in config.json")
+        raise SystemExit("No llm.bohe or llm.gemini config found in config.json")
 
     api_base = gem["api_base"]
     api_key = gem["api_key"]

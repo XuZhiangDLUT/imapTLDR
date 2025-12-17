@@ -117,9 +117,10 @@ def _get_email_text(msg) -> str:
 
 def _build_gemini_client(cfg: dict) -> GeminiClient:
     llm_cfg = cfg.get("llm", {})
-    provider = llm_cfg.get("gemini") or cfg.get("gemini")
+    # Prefer new llm.bohe config, fallback to legacy llm.gemini / gemini for backward compatibility
+    provider = llm_cfg.get("bohe") or llm_cfg.get("gemini") or cfg.get("bohe") or cfg.get("gemini")
     if not provider:
-        raise SystemExit("No Gemini configuration found (llm.gemini or gemini).")
+        raise SystemExit("No provider configuration found (llm.bohe / llm.gemini / bohe / gemini).")
     timeout = float(llm_cfg.get("request_timeout_seconds", 30.0))
     cli = new_openai(provider["api_base"], provider["api_key"], timeout=timeout)
     model = provider.get("model", "gemini-2.5-pro")
