@@ -269,7 +269,7 @@ def _build_openai_for_task(task_cfg: dict) -> OpenAI | None:
 def preflight_check_llm(cfg: dict) -> bool:
     """
     启动时预检：检查 llm.tasks 中配置的各个任务的模型是否都能正常调用 API。
-    发送一个简单的测试消息，验证能否返回响应。
+    发送一个简单的测试消息，验证能否返回响应。使用与任务相同的参数配置。
 
     Returns:
         True 如果所有任务的 LLM 都能正常调用，否则抛出异常或返回 False。
@@ -288,8 +288,9 @@ def preflight_check_llm(cfg: dict) -> bool:
 
     logger.info(f"LLM 预检: 开始检查 {len(tasks_cfg)} 个任务的 LLM 配置...")
 
-    # 收集需要检查的唯一 (provider, api_base, api_key, model) 组合，避免重复检查
-    checked_combos: set[tuple[str, str, str]] = set()  # (api_base, api_key, model)
+    # 收集需要检查的唯一配置组合，避免重复检查
+    # 包含 enable_thinking 和 thinking_budget 因为它们会影响 API 行为
+    checked_combos: set[tuple[str, str, str, bool, int]] = set()
     failed_tasks: list[str] = []
 
     for task_name in tasks_cfg.keys():
@@ -311,28 +312,45 @@ def preflight_check_llm(cfg: dict) -> bool:
         api_key = task.get("api_key") or ""
         model = task.get("model") or ""
         provider = task.get("provider") or "unknown"
+        enable_thinking = bool(task.get("enable_thinking", False))
+        thinking_budget = int(task.get("thinking_budget", 0))
 
         if not api_base or not api_key or not model:
             logger.warning(f"LLM 预检: 任务 '{task_name}' 缺少 api_base/api_key/model，跳过")
             continue
 
-        combo_key = (api_base, api_key, model)
+        combo_key = (api_base, model, api_key, enable_thinking, thinking_budget)
         if combo_key in checked_combos:
             logger.info(f"LLM 预检: 任务 '{task_name}' 与已检查的配置相同，跳过重复检查")
             continue
         checked_combos.add(combo_key)
 
-        logger.info(f"LLM 预检: 检查任务 '{task_name}' (provider={provider}, model={model})...")
+        thinking_desc = f"thinking={enable_thinking}" + (f", budget={thinking_budget}" if enable_thinking else "")
+        logger.info(f"LLM 预检: 检查任务 '{task_name}' (provider={provider}, model={model}, {thinking_desc})...")
 
         try:
             cli = new_openai(api_base, api_key, timeout=30.0)
-            # 发送一个简单的数学测试请求，验证模型能正常推理并返回内容
+
+            # 构建与任务相同的 extra_body 参数
+            extra: dict = {}
+            if enable_thinking:
+                extra["enable_thinking"] = True
+                extra["thinking_budget"] = thinking_budget
+                # Gemini 2.5+ 的 thinking 配置
+                if model.startswith("gemini-2.5") or model.startswith("gemini-3") or model.startswith("gemini-"):
+                    gen_cfg = extra.get("generationConfig") or {}
+                    think_cfg = gen_cfg.get("thinkingConfig") or {}
+                    think_cfg["thinkingBudget"] = thinking_budget if thinking_budget >= 0 else -1
+                    gen_cfg["thinkingConfig"] = think_cfg
+                    extra["generationConfig"] = gen_cfg
+
+            # 发送测试请求，使用与任务相同的参数（不限制 max_tokens，与正常任务一致）
             r = cli.chat.completions.create(
                 model=model,
                 temperature=0.0,
                 messages=[{"role": "user", "content": "请计算 2+3 等于几？只回答数字。"}],
-                max_tokens=16,
                 timeout=30.0,
+                extra_body=extra or None,
             )
             response_text = (r.choices[0].message.content or "").strip()
             if not response_text:
@@ -715,7 +733,7 @@ def summarize_job(cfg: dict):
                 subject = f"{pref.get('summarize','[机器总结]')} {folder}（{len(batch)}封）"
                 out = build_email(subject, imap['email'], imap['email'], html, None)
                 append_unseen(c, folder, out)
-                logger.info(f"Appended summary: {subject}")
+                logger.info(f"已写入总结邮件: {subject}")
                 for uid, _, _ in batch:
                     mark_seen(c, folder, uid)
                 # checkpoint after each batch
@@ -824,7 +842,7 @@ def qwen_translate_batch(cli: OpenAI, model: str, segments: list[str], timeout: 
         )
         out = (r.choices[0].message.content or '').split("\n\n-----\n\n")
     except Exception as e:
-        logger.info(f"LLM translate error or timeout: {e}")
+        logger.info(f"LLM 翻译调用出错或超时: {e}")
         out = [''] * len(segments)
     if len(out) < len(segments):
         out += ['']*(len(segments)-len(out))
@@ -855,7 +873,7 @@ def qwen_translate_single(cli: OpenAI, model: str, text: str, timeout: float | i
         )
         return (r.choices[0].message.content or '').strip()
     except Exception as e:
-        logger.info(f"LLM translate single error or timeout: {e}")
+        logger.info(f"LLM 单段翻译出错或超时: {e}")
         return ''
 
 
@@ -1067,7 +1085,7 @@ def translate_job(cfg: dict):
         # 对仍然不合格的段落，使用“兜底翻译任务”配置进行最后一次翻译尝试（不启用思考）
         if pending and fallback_model:
             logger.warning(
-                f"translate fallback: using fallback model={fallback_model} for {len(pending)} segments"
+                f"翻译兜底: 使用兜底模型={fallback_model} 处理 {len(pending)} 个片段"
             )
             for idx in list(pending):
                 src = batch[idx]
@@ -1089,7 +1107,7 @@ def translate_job(cfg: dict):
                     backend = fallback_cli or cli
                     tr = qwen_translate_single(backend, fallback_model, src, timeout=translate_timeout) if backend else ""
                 except Exception as exc:
-                    logger.info(f"fallback translate error: {exc}")
+                    logger.info(f"兜底翻译出错: {exc}")
                     tr = ''
                 outs[idx] = (tr or '').strip()
             # 兜底后再检查一遍哪些段落仍然看起来“没有翻译成功”
@@ -1097,8 +1115,8 @@ def translate_job(cfg: dict):
 
         if pending:
             logger.warning(
-                f"translate retries exhausted after {max_translate_attempts} attempts; "
-                f"{len(pending)} segments still empty (after fallback)"
+                f"翻译重试已耗尽（共 {max_translate_attempts} 次），"
+                f"仍有 {len(pending)} 个片段未完成（含兜底尝试）"
             )
         return outs
 
@@ -1106,12 +1124,12 @@ def translate_job(cfg: dict):
     try:
         for folder, uid, msg in scan_translate_targets(c, cfg, excluded):
             sub = decode_subject(msg)
-            logger.info(f"Processing subject (translate): {sub} in {folder} (uid={uid})")
+            logger.info(f"处理翻译邮件: {sub} | 文件夹={folder} | uid={uid}")
             html, text = pick_html_or_text(msg)
             if not html and text:
                 html = f"<html><body><pre>{text}</pre></body></html>"
             if not html:
-                logger.info("Skip empty body; mark seen")
+                logger.info("跳过空内容邮件，标记为已读")
                 mark_seen(c, folder, uid)
                 continue
 
@@ -1119,7 +1137,7 @@ def translate_job(cfg: dict):
             orig_msgid = msg.get('Message-ID') or ''
             if not force_retranslate:
                 if orig_msgid and has_linked_reply(c, folder, orig_msgid, pref.get('translate','[机器翻译]')):
-                    logger.info("Skip already translated (idempotent)")
+                    logger.info("跳过已翻译邮件（幂等检查）")
                     mark_seen(c, folder, uid)
                     continue
 
@@ -1235,7 +1253,7 @@ def translate_job(cfg: dict):
             out = build_email(new_subject, imap['email'], imap['email'], zh_html, None, in_reply_to=msg.get('Message-ID'))
             append_unseen(c, folder or 'INBOX', out)
             mark_seen(c, folder, uid)
-            logger.info(f"Appended translated mail: {new_subject}")
+            logger.info(f"已写入翻译邮件: {new_subject}")
     finally:
         try:
             c.logout()

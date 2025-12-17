@@ -153,7 +153,52 @@ def _setup_logging():
                     m = (
                         m[: idx + len(marker)]
                         + Fore.CYAN
+                        + Style.BRIGHT
                         + folder
+                        + Style.RESET_ALL
+                    )
+
+            # 处理翻译邮件: {sub} | 文件夹={folder} | uid={uid}
+            if "处理翻译邮件:" in m or "待翻译邮件:" in m or "待总结邮件:" in m:
+                # 高亮 文件夹= 后面的值
+                m = _color_kv(m, "文件夹=", Fore.CYAN + Style.BRIGHT)
+                # 高亮 uid= 后面的值
+                m = _color_kv(m, "uid=", Fore.YELLOW)
+
+            # 跳过文件夹（不存在或无法访问）: {folder}
+            if "跳过文件夹" in m and "不存在或无法访问" in m:
+                marker = "）: "
+                idx = m.find(marker)
+                if idx != -1 and idx + len(marker) < len(m):
+                    rest_part = m[idx + len(marker):]
+                    # 文件夹名通常在括号之前
+                    paren_idx = rest_part.find(" (")
+                    if paren_idx != -1:
+                        folder = rest_part[:paren_idx]
+                        remaining = rest_part[paren_idx:]
+                    else:
+                        folder = rest_part
+                        remaining = ""
+                    m = (
+                        m[: idx + len(marker)]
+                        + Fore.CYAN
+                        + Style.BRIGHT
+                        + folder
+                        + Style.RESET_ALL
+                        + remaining
+                    )
+
+            # 已写入翻译邮件 / 已写入总结邮件: 高亮邮件主题
+            if m.startswith("已写入翻译邮件: ") or m.startswith("已写入总结邮件: "):
+                marker = ": "
+                idx = m.find(marker)
+                if idx != -1 and idx + len(marker) < len(m):
+                    subject = m[idx + len(marker) :]
+                    m = (
+                        m[: idx + len(marker)]
+                        + Fore.GREEN
+                        + Style.BRIGHT
+                        + subject
                         + Style.RESET_ALL
                     )
 
@@ -223,6 +268,57 @@ def _setup_logging():
                             + m[end:]
                         )
 
+            # 翻译重试 / 翻译兜底相关
+            if "翻译重试" in m or "翻译兜底" in m:
+                # 高亮 "剩余 N 个片段" 中的数字
+                import re as _re
+                pattern = r"(\d+)\s*个片段"
+                match = _re.search(pattern, m)
+                if match:
+                    num = match.group(1)
+                    m = m[:match.start(1)] + Fore.YELLOW + Style.BRIGHT + num + Style.RESET_ALL + m[match.end(1):]
+                # 高亮兜底模型名
+                m = _color_kv(m, "兜底模型=", Fore.CYAN + Style.BRIGHT)
+
+            # 翻译重试已耗尽
+            if "翻译重试已耗尽" in m:
+                import re as _re
+                pattern = r"(\d+)\s*个片段"
+                match = _re.search(pattern, m)
+                if match:
+                    num = match.group(1)
+                    m = m[:match.start(1)] + Fore.RED + Style.BRIGHT + num + Style.RESET_ALL + m[match.end(1):]
+
+            # LLM 预检相关
+            if "LLM 预检" in m:
+                # 高亮任务名
+                import re as _re
+                task_match = _re.search(r"任务 '([^']+)'", m)
+                if task_match:
+                    task_name = task_match.group(1)
+                    m = m.replace(f"'{task_name}'", f"'{Fore.CYAN}{Style.BRIGHT}{task_name}{Style.RESET_ALL}'")
+                # 高亮 provider= 和 model=
+                m = _color_kv(m, "provider=", Fore.YELLOW)
+                m = _color_kv(m, "model=", Fore.MAGENTA + Style.BRIGHT)
+
+            # 总结规划相关
+            if "总结规划:" in m:
+                m = _color_kv(m, "原文字符数=", Fore.CYAN)
+                m = _color_kv(m, "预估 tokens=", Fore.YELLOW)
+                # 高亮拆分段数
+                import re as _re
+                split_match = _re.search(r"拆分为\s*(\d+)\s*段", m)
+                if split_match:
+                    num = split_match.group(1)
+                    start_pos = split_match.start(1)
+                    end_pos = split_match.end(1)
+                    m = m[:start_pos] + Fore.MAGENTA + Style.BRIGHT + num + Style.RESET_ALL + m[end_pos:]
+
+            # 分段 N/M 相关
+            if m.startswith("分段 "):
+                m = _color_kv(m, "字符数=", Fore.CYAN)
+                m = _color_kv(m, "预估 tokens=", Fore.YELLOW)
+
             msg_for_display = m
 
             # Colorize log level for quick scanning
@@ -288,6 +384,13 @@ def _setup_logging():
             l.setLevel(logging.WARNING)
         else:
             l.setLevel(logging.WARNING)
+
+    # 完全静默 cssutils 日志（premailer 依赖），避免大量 CSS 属性警告
+    for name in ("cssutils", "cssutils.parse", "cssutils.serialize"):
+        l = logging.getLogger(name)
+        l.handlers = []
+        l.propagate = False
+        l.setLevel(logging.CRITICAL + 10)
 
 
 def start_scheduler():
