@@ -13,7 +13,12 @@ import logging
 from datetime import datetime
 from pathlib import Path
 from premailer import transform as inline_css
-from .jobs import _save_summary_payload, new_openai, deepseek_summarize
+from .jobs import (
+    _save_summary_payload,
+    deepseek_summarize,
+    _get_llm_task_config,
+    _build_openai_for_task,
+)
 from .utils import rough_token_count
 
 logger = logging.getLogger("mailbot")
@@ -50,31 +55,29 @@ def summarize_once(cfg: dict, folder: str | None = None, batch: int = 5):
             if len(filtered) >= batch:
                 break
 
-        llm_cfg = cfg.get("llm", {})
-        timeout = float(llm_cfg.get("summarize_timeout_seconds", llm_cfg.get("request_timeout_seconds", 15.0)))
-        provider_kind = str(llm_cfg.get("summarizer_provider", "siliconflow")).lower()
-
-        if provider_kind == "gemini":
-            provider = llm_cfg.get("gemini") or cfg.get("gemini") or {}
-        else:
-            provider = llm_cfg.get("siliconflow") or cfg.get("siliconflow2") or cfg.get("siliconflow") or {}
-        if not provider:
-            raise ValueError("No LLM provider configured for summarization. Set llm.siliconflow or llm.gemini in config.json")
-
-        # For Gemini, prefer the model from its provider; keep summarizer_model for DeepSeek & translation fallback
-        if provider_kind == "gemini":
-            model = provider.get("model") or "gemini-2.5-pro"
-        else:
-            model = llm_cfg.get("summarizer_model") or provider.get("model") or "deepseek-ai/DeepSeek-V3.2-Exp"
-
-        enable_thinking = bool(llm_cfg.get("enable_thinking", True))
-        thinking_budget = int(llm_cfg.get("thinking_budget", 4096))
-        use_mock = bool(llm_cfg.get("mock", False) or cfg.get("test", {}).get("mock_llm", False))
-        prompt_path = Path(llm_cfg.get('prompt_file', 'Prompt.txt'))
-        prompt = prompt_path.read_text(encoding='utf-8') if prompt_path.exists() else 'Summarize in Chinese.'
-        cli = new_openai(provider["api_base"], provider["api_key"], timeout=timeout) if not use_mock else None
+        # 一次性「手动触发总结」任务使用独立的 LLM 任务配置
+        task = _get_llm_task_config(
+            cfg,
+            "summarize_once",
+            default_provider="siliconflow",
+            default_model="deepseek-ai/DeepSeek-V3.2-Exp",
+            global_timeout_key="summarize_timeout_seconds",
+            default_timeout=15.0,
+            default_enable_thinking=True,
+            default_thinking_budget=4096,
+            default_expect_json=True,
+            default_prompt_file="Prompt.txt",
+        )
+        timeout = float(task["timeout_seconds"] or 15.0)
+        provider_kind = task["provider"]
+        model = task["model"]
+        enable_thinking = bool(task["enable_thinking"])
+        thinking_budget = int(task["thinking_budget"])
+        use_mock = bool(task["mock"])
+        prompt_path = Path(task.get("prompt_file") or "Prompt.txt")
+        prompt = prompt_path.read_text(encoding="utf-8") if prompt_path.exists() else "Summarize in Chinese."
+        cli = _build_openai_for_task(task)
         if not use_mock:
-            # Log which LLM will be used for one-off summarization
             logger.info(
                 f"Summarize-once LLM configured: provider={provider_kind}, model={model}, "
                 f"enable_thinking={enable_thinking}, thinking_budget={thinking_budget}"
@@ -146,7 +149,7 @@ def summarize_once(cfg: dict, folder: str | None = None, batch: int = 5):
                     enable_thinking,
                     thinking_budget,
                     timeout=timeout,
-                    expect_json=True,
+                    expect_json=bool(task.get("expect_json", True)),
                 )
                 try:
                     import json as _json

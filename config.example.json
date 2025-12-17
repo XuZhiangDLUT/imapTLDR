@@ -50,15 +50,42 @@
                                "api_key":  "YOUR_X666_API_KEY",
                                "model":  "gemini-2.5-pro"
                            },
-                "summarizer_provider":  "gemini",
-                "summarizer_model":  "deepseek-ai/DeepSeek-V3.2-Exp",
-                "enable_thinking":  true,
-                "thinking_budget":  -1,
-                "prompt_file":  "Prompt.txt",
-                "request_timeout_seconds":  300,
-                "summarize_timeout_seconds":  15,
-                "translator_model":  "Qwen/Qwen2.5-7B-Instruct",
-                "translate_timeout_seconds":  300
+                "tasks":  {
+                              "summarize_job":  {
+                                                    "provider":  "siliconflow",
+                                                    "model":  "deepseek-ai/DeepSeek-V3.2-Exp",
+                                                    "enable_thinking":  true,
+                                                    "thinking_budget":  -1,
+                                                    "expect_json":  true,
+                                                    "prompt_file":  "Prompt.txt",
+                                                    "timeout_seconds":  300
+                                                },
+                              "summarize_once":  {
+                                                     "provider":  "siliconflow",
+                                                     "model":  "deepseek-ai/DeepSeek-V3.2-Exp",
+                                                     "enable_thinking":  true,
+                                                     "thinking_budget":  -1,
+                                                     "expect_json":  true,
+                                                     "prompt_file":  "Prompt.txt",
+                                                     "timeout_seconds":  300
+                                                 },
+                              "translate":  {
+                                                "provider":  "siliconflow",
+                                                "model":  "Qwen/Qwen2.5-7B-Instruct",
+                                                "enable_thinking":  false,
+                                                "thinking_budget":  0,
+                                                "expect_json":  false,
+                                                "timeout_seconds":  300
+                                            },
+                              "translate_fallback":  {
+                                                       "provider":  "siliconflow",
+                                                       "model":  "deepseek-ai/DeepSeek-V3.2-Exp",
+                                                       "enable_thinking":  false,
+                                                       "thinking_budget":  0,
+                                                       "expect_json":  false,
+                                                       "timeout_seconds":  300
+                                                   }
+                          }
             },
     "translate":  {
                       "interval_minutes":  10,

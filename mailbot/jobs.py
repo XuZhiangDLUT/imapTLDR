@@ -181,6 +181,91 @@ def new_openai(api_base: str, api_key: str, timeout: float | int = 15.0) -> Open
     return OpenAI(base_url=base, api_key=api_key, timeout=timeout)
 
 
+def _get_llm_task_config(
+    cfg: dict,
+    task_name: str,
+    *,
+    default_provider: str,
+    default_model: str,
+    global_timeout_key: str | None,
+    default_timeout: float,
+    default_enable_thinking: bool,
+    default_thinking_budget: int,
+    default_expect_json: bool,
+    default_prompt_file: str | None = None,
+) -> dict:
+    """
+    Resolve per-task LLM configuration.
+
+    Priority:
+    1. llm.tasks[task_name] 下的字段（provider / model / enable_thinking 等）
+    2. llm.{provider} 级别的 api_base / api_key / model 作为兜底
+    3. 传入的 default_* 作为最终默认值
+    """
+    llm_cfg = cfg.get("llm", {}) or {}
+    tasks_cfg = llm_cfg.get("tasks") or {}
+    tcfg = tasks_cfg.get(task_name) or {}
+
+    provider = str(tcfg.get("provider") or default_provider).lower()
+
+    # provider 级别配置：支持 llm.providers.{name} 或老的 llm.{name}
+    providers = llm_cfg.get("providers") or {}
+    provider_cfg = providers.get(provider) or llm_cfg.get(provider) or cfg.get(provider) or {}
+
+    api_base = tcfg.get("api_base") or provider_cfg.get("api_base")
+    api_key = tcfg.get("api_key") or provider_cfg.get("api_key")
+    model = tcfg.get("model") or provider_cfg.get("model") or default_model
+
+    if global_timeout_key:
+        base_timeout = float(
+            llm_cfg.get(global_timeout_key, llm_cfg.get("request_timeout_seconds", default_timeout))
+        )
+    else:
+        base_timeout = float(llm_cfg.get("request_timeout_seconds", default_timeout))
+    timeout_seconds = float(tcfg.get("timeout_seconds", base_timeout))
+
+    enable_thinking = bool(tcfg.get("enable_thinking", default_enable_thinking))
+    thinking_budget = int(tcfg.get("thinking_budget", default_thinking_budget))
+    expect_json = bool(tcfg.get("expect_json", default_expect_json))
+    prompt_file = tcfg.get("prompt_file", default_prompt_file)
+
+    use_mock = bool(llm_cfg.get("mock", False) or cfg.get("test", {}).get("mock_llm", False))
+
+    return {
+        "task_name": task_name,
+        "provider": provider,
+        "api_base": api_base,
+        "api_key": api_key,
+        "model": model,
+        "timeout_seconds": timeout_seconds,
+        "enable_thinking": enable_thinking,
+        "thinking_budget": thinking_budget,
+        "expect_json": expect_json,
+        "prompt_file": prompt_file,
+        "mock": use_mock,
+        "raw": tcfg,
+    }
+
+
+def _build_openai_for_task(task_cfg: dict) -> OpenAI | None:
+    """
+    Create an OpenAI client for a given task config.
+
+    当处于 mock 模式时返回 None；否则如果缺少 api_base / api_key 则抛出明确错误。
+    """
+    if task_cfg.get("mock"):
+        return None
+    api_base = task_cfg.get("api_base")
+    api_key = task_cfg.get("api_key")
+    if not api_base or not api_key:
+        raise ValueError(
+            f"No LLM provider configured for task '{task_cfg.get('task_name')}' "
+            "(missing api_base or api_key)"
+        )
+    timeout = float(task_cfg.get("timeout_seconds") or 15.0)
+    return new_openai(str(api_base), str(api_key), timeout=timeout)
+
+
 def deepseek_summarize(
     cli: OpenAI,
     model: str,
@@ -302,46 +387,42 @@ def summarize_job(cfg: dict):
     sum_cfg = cfg.get('summarize', {})
     save_summary_json = bool(sum_cfg.get('save_summary_json', True))
 
-    llm_cfg = cfg.get('llm', {})
-    use_mock = bool(llm_cfg.get('mock', False) or cfg.get('test', {}).get('mock_llm', False))
-    provider_kind = str(llm_cfg.get('summarizer_provider', 'siliconflow')).lower()
+    # 每次定时总结任务使用独立的 LLM 任务配置
+    task = _get_llm_task_config(
+        cfg,
+        "summarize_job",
+        default_provider="siliconflow",
+        default_model="deepseek-ai/DeepSeek-V3.2-Exp",
+        global_timeout_key="summarize_timeout_seconds",
+        default_timeout=15.0,
+        default_enable_thinking=True,
+        default_thinking_budget=4096,
+        default_expect_json=True,
+        default_prompt_file="Prompt.txt",
+    )
+    cli = _build_openai_for_task(task)
+    provider_kind = task["provider"]
+    model = task["model"]
+    use_mock = bool(task["mock"])
+    enable_thinking = bool(task["enable_thinking"])
+    thinking_budget = int(task["thinking_budget"])
+    summarize_timeout = float(task["timeout_seconds"] or 15.0)
 
-    if not use_mock:
-        if provider_kind == 'gemini':
-            provider = llm_cfg.get('gemini') or cfg.get('gemini') or {}
-        else:
-            # Default: reuse SiliconFlow-compatible provider for DeepSeek
-            provider = llm_cfg.get('siliconflow') or cfg.get('siliconflow2') or cfg.get('siliconflow') or {}
-        if not provider:
-            raise ValueError('No LLM provider configured for summarization')
-
-        summarize_timeout = float(llm_cfg.get('summarize_timeout_seconds', llm_cfg.get('request_timeout_seconds', 15.0)))
-        cli = new_openai(provider['api_base'], provider['api_key'], timeout=summarize_timeout)
-        # For Gemini, prefer model from gemini provider; keep summarizer_model for DeepSeek + translation fallback.
-        if provider_kind == 'gemini':
-            model = provider.get('model') or 'gemini-2.5-pro'
-        else:
-            model = llm_cfg.get('summarizer_model') or provider.get('model') or 'deepseek-ai/DeepSeek-V3.2-Exp'
-        enable_thinking = llm_cfg.get('enable_thinking', True)
-        thinking_budget = int(llm_cfg.get('thinking_budget', 4096))
-        # Log which LLM will be used for machine summarization
-        thinking_mode = "关闭" if not enable_thinking else "开启"
-        if enable_thinking:
-            thinking_budget_desc = "自动" if thinking_budget < 0 else str(thinking_budget)
-        else:
-            thinking_budget_desc = "N/A"
+    # 日志中明确此次总结任务使用的后端配置
+    thinking_mode = "关闭" if not enable_thinking else "开启"
+    if enable_thinking:
+        thinking_budget_desc = "自动" if thinking_budget < 0 else str(thinking_budget)
+    else:
+        thinking_budget_desc = "N/A"
+    if use_mock:
+        logger.info("机器总结 LLM: 启用 mock 模式（不调用外部 LLM 接口）")
+    else:
         logger.info(
             f"机器总结 LLM 配置: 提供商={provider_kind}, 模型={model}, "
             f"思考模式={thinking_mode}, 思考 token 上限={thinking_budget_desc}"
         )
-    else:
-        cli = None
-        model = ''
-        enable_thinking = False
-        thinking_budget = 0
-        logger.info("机器总结 LLM: 启用 mock 模式（不调用外部 LLM 接口）")
 
-    prompt_path = Path(llm_cfg.get('prompt_file', 'Prompt.txt'))
+    prompt_path = Path(task.get('prompt_file') or 'Prompt.txt')
     prompt = prompt_path.read_text(encoding='utf-8') if prompt_path.exists() else '请用中文进行总结，并给出结构化要点。'
 
     folders = sum_cfg.get('folders', DEFAULT_SUMMARY_FOLDERS)
@@ -427,7 +508,7 @@ def summarize_job(cfg: dict):
                             enable_thinking,
                             thinking_budget,
                             timeout=summarize_timeout,
-                            expect_json=True,
+                            expect_json=bool(task.get("expect_json", True)),
                         )
                         # try parse json articles
                         parsed = None
@@ -695,9 +776,21 @@ def translate_job(cfg: dict):
     imap = cfg['imap']; pref = cfg.get('prefix', {'translate':'[机器翻译]','summarize':'[机器总结]'})
     excluded = [pref.get('translate','[机器翻译]'), pref.get('summarize','[机器总结]')]
 
-    llm_cfg = cfg.get('llm', {})
-    use_mock = bool(llm_cfg.get('mock', False) or cfg.get('test', {}).get('mock_llm', False))
-    translate_timeout = float(llm_cfg.get('translate_timeout_seconds', llm_cfg.get('request_timeout_seconds', 300.0)))
+    # 机器翻译主任务：独立的 LLM 任务配置
+    main_task = _get_llm_task_config(
+        cfg,
+        "translate",
+        default_provider="siliconflow",
+        default_model="Qwen/Qwen2.5-7B-Instruct",
+        global_timeout_key="translate_timeout_seconds",
+        default_timeout=300.0,
+        default_enable_thinking=False,
+        default_thinking_budget=0,
+        default_expect_json=False,
+        default_prompt_file=None,
+    )
+    use_mock = bool(main_task["mock"])
+    translate_timeout = float(main_task["timeout_seconds"] or 300.0)
     tcfg = cfg.get('translate', {})
     inplace = bool(tcfg.get('inplace_replace', False))
     strict_line = bool(tcfg.get('strict_line', True))
@@ -707,21 +800,47 @@ def translate_job(cfg: dict):
     rpm_limit = int(tcfg.get('rpm_limit', 1000))
     tpm_limit = int(tcfg.get('tpm_limit', 50000))
     max_workers = int(tcfg.get('concurrency', 6))
+    # 构建主翻译模型客户端 + 兜底翻译模型客户端（可使用不同的链接 / APIKey / 模型）
     if not use_mock:
-        sf = llm_cfg.get('siliconflow') or cfg.get('siliconflow2') or cfg.get('siliconflow')
-        if not sf:
-            raise ValueError('No LLM provider configured for translation')
-        cli = new_openai(sf['api_base'], sf['api_key'], timeout=translate_timeout)
-        trans_model = llm_cfg.get('translator_model') or (cfg.get('siliconflow2',{}) or {}).get('model') or (sf.get('model')) or 'Qwen/Qwen2.5-7B-Instruct'
-        # 使用 summarize_model 作为 DeepSeek 兜底模型；调用时不启用思考，仅作普通翻译
-        fallback_model = llm_cfg.get('summarizer_model') or ''
-        # 日志中明确当前翻译使用的主模型和兜底模型
+        cli = _build_openai_for_task(main_task)
+        trans_model = main_task["model"]
+
+        # 兜底翻译任务配置：完全解耦主翻译模型
+        fallback_task = _get_llm_task_config(
+            cfg,
+            "translate_fallback",
+            default_provider=main_task["provider"],
+            default_model="",
+            global_timeout_key="translate_timeout_seconds",
+            default_timeout=translate_timeout,
+            default_enable_thinking=False,
+            default_thinking_budget=0,
+            default_expect_json=False,
+            default_prompt_file=None,
+        )
+        # 如果没有单独配置 translate_fallback，则兼容旧字段 translate.fallback_model
+        fallback_model = fallback_task["model"]
+        fallback_cli: OpenAI | None
+        if not fallback_model:
+            # 兼容旧版配置：从 llm.tasks.translate.fallback_model 读取
+            legacy_fallback = (main_task.get("raw") or {}).get("fallback_model") or ""
+            fallback_model = legacy_fallback or ""
+            fallback_cli = cli
+        else:
+            # 如果单独指定了 api_base / api_key，则允许使用完全不同的后端
+            try:
+                fallback_cli = _build_openai_for_task(fallback_task)
+            except ValueError:
+                # 若兜底任务缺少凭据，则回退到主客户端 + 模型名
+                fallback_cli = cli
+
         logger.info(
-            f"机器翻译 LLM 配置: 主模型={trans_model}, 提供商=siliconflow, "
+            f"机器翻译 LLM 配置: 主模型={trans_model}, 提供商={main_task['provider']}, "
             f"兜底模型={fallback_model or '(none)'}"
         )
     else:
         cli = None
+        fallback_cli = None  # type: ignore[assignment]
         trans_model = ''
         fallback_model = ''
         logger.info("机器翻译 LLM: 启用 mock 模式（不调用外部 LLM 接口）")
@@ -813,7 +932,7 @@ def translate_job(cfg: dict):
                     f"翻译重试 {attempt}/{max_translate_attempts}，剩余 {len(pending)} 个片段待处理"
                 )
 
-        # 对仍然不合格的段落，使用 DeepSeek（summarizer_model）兜底翻译一次，不启用思考
+        # 对仍然不合格的段落，使用“兜底翻译任务”配置进行最后一次翻译尝试（不启用思考）
         if pending and fallback_model:
             logger.warning(
                 f"translate fallback: using fallback model={fallback_model} for {len(pending)} segments"
@@ -833,9 +952,10 @@ def translate_job(cfg: dict):
                 except Exception:
                     pass
                 try:
-                    # 直接复用 qwen_translate_single 的翻译 prompt，只是换成 DeepSeek 模型；
+                    # 直接复用 qwen_translate_single 的翻译 prompt，只是换成兜底模型；
                     # 不传任何 enable_thinking / thinking_budget 之类的额外参数。
-                    tr = qwen_translate_single(cli, fallback_model, src, timeout=translate_timeout)
+                    backend = fallback_cli or cli
+                    tr = qwen_translate_single(backend, fallback_model, src, timeout=translate_timeout) if backend else ""
                 except Exception as exc:
                     logger.info(f"fallback translate error: {exc}")
                     tr = ''
