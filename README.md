@@ -100,6 +100,7 @@ run.py                   # CLI 入口，支持 summarize / summarize_job
 - `concurrency`: 翻译线程池大小，建议 6-10；
 - `rpm_limit` / `tpm_limit`: 令牌桶参数，对应 LLM 速率限制；
 - `max_retry` / `force_retranslate`: 控制重试次数以及是否对已有回复邮件再次翻译。
+- `delete_translated_email`: true 时在写入翻译邮件后删除原始邮件（谨慎开启）。
 
 ### `llm`
 - `mock`: true 时使用 `mailbot.mock_llm`，无需真实 API。

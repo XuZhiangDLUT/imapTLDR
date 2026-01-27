@@ -249,6 +249,16 @@ def mark_unseen(client: IMAPClient, folder: str, uid: int):
     client.remove_flags([uid], [b"\\Seen"])  # ensure unread
 
 
+def delete_message(client: IMAPClient, folder: str, uid: int, expunge: bool = True):
+    client.select_folder(folder)
+    client.add_flags([uid], [b"\\Deleted"])
+    if expunge:
+        try:
+            client.expunge()
+        except Exception:
+            pass
+
+
 def list_unseen(client: IMAPClient, folder: str, exclude_auto_generated: bool = False) -> list[int]:
     client.select_folder(folder)
     if exclude_auto_generated:

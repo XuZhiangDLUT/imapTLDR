@@ -131,6 +131,7 @@ from .imap_client import (
     build_email,
     append_unseen,
     mark_seen,
+    delete_message,
     has_linked_reply,
 )
 from .utils import decode_subject, pass_prefix, split_by_chars, rough_token_count
@@ -944,6 +945,7 @@ def translate_job(cfg: dict):
     tcfg = cfg.get('translate', {})
     inplace = bool(tcfg.get('inplace_replace', False))
     strict_line = bool(tcfg.get('strict_line', True))
+    delete_translated = bool(tcfg.get('delete_translated_email', False))
     # 当 force_retranslate 为 true 时，会跳过 has_linked_reply 幂等检查，用于重新翻译已有邮件
     force_retranslate = bool(tcfg.get('force_retranslate', False))
     max_translate_attempts = max(1, int(tcfg.get('max_retry', 3)))
@@ -1251,8 +1253,15 @@ def translate_job(cfg: dict):
             zh_html = _fix_repeated_inplace_spans(zh_html)
             new_subject = f"{pref.get('translate','[机器翻译]')} {sub}"
             out = build_email(new_subject, imap['email'], imap['email'], zh_html, None, in_reply_to=msg.get('Message-ID'))
-            append_unseen(c, folder or 'INBOX', out)
-            mark_seen(c, folder, uid)
+            target_folder = folder or 'INBOX'
+            append_unseen(c, target_folder, out)
+            mark_seen(c, target_folder, uid)
+            if delete_translated:
+                try:
+                    delete_message(c, target_folder, uid)
+                    logger.info(f"已删除原始邮件: {sub} (uid={uid})")
+                except Exception as e:
+                    logger.info(f"删除原始邮件失败: {sub} (uid={uid}) -> {e}")
             logger.info(f"已写入翻译邮件: {new_subject}")
     finally:
         try:

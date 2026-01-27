@@ -3,8 +3,10 @@ import logging
 import os
 import signal
 import threading
+import time
 from datetime import datetime, timedelta
 import sys
+import imaplib
 
 import pytz
 from apscheduler.schedulers.blocking import BlockingScheduler as BackgroundScheduler
@@ -17,6 +19,25 @@ from .jobs import summarize_job, translate_job, preflight_check_llm
 
 
 logger = logging.getLogger("mailbot")
+
+
+def _iter_exception_chain(exc: BaseException):
+    seen = set()
+    cur = exc
+    while cur is not None and id(cur) not in seen:
+        yield cur
+        seen.add(id(cur))
+        cur = getattr(cur, "__cause__", None) or getattr(cur, "__context__", None)
+
+
+def _is_imap_disconnect_error(exc: BaseException) -> bool:
+    for err in _iter_exception_chain(exc):
+        if isinstance(err, imaplib.IMAP4.abort):
+            return True
+        msg = str(err).lower()
+        if "socket error" in msg or "eof" in msg:
+            return True
+    return False
 
 
 def _setup_logging():
@@ -429,7 +450,25 @@ def start_scheduler():
             t0 = datetime.now(tz)
             logger.info("START 开始执行机器总结")
             try:
-                summarize_job(cfg)
+                max_attempts = 2
+                retry_delay = 5.0
+                attempt = 0
+                while True:
+                    attempt += 1
+                    try:
+                        summarize_job(cfg)
+                        break
+                    except Exception as e:
+                        if _is_imap_disconnect_error(e) and attempt < max_attempts:
+                            logger.warning(
+                                f"IMAP 连接中断，将在 {retry_delay:.0f}s 后重试（{attempt}/{max_attempts}）: {e}"
+                            )
+                            try:
+                                time.sleep(retry_delay)
+                            except Exception:
+                                pass
+                            continue
+                        raise
             except Exception as e:
                 logger.exception(f"机器总结出错: {e}")
             finally:

@@ -121,6 +121,7 @@
                       "concurrency":  6,
                       "rpm_limit":  1000,
                       "tpm_limit":  50000,
-                      "max_retry":  3
+                      "max_retry":  3,
+                      "delete_translated_email":  false
                   }
 }
