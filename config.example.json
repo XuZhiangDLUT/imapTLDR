@@ -122,7 +122,6 @@
                       "rpm_limit":  1000,
                       "tpm_limit":  50000,
                       "max_retry":  3,
-                      "delete_translated_email":  false,
-                      "trash_folder":  "其他文件夹/垃圾箱"
+                      "delete_translated_email":  false
                   }
 }

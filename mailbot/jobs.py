@@ -131,7 +131,7 @@ from .imap_client import (
     build_email,
     append_unseen,
     mark_seen,
-    move_to_trash,
+    move_to_junk,
     has_linked_reply,
 )
 from .utils import decode_subject, pass_prefix, split_by_chars, rough_token_count
@@ -946,7 +946,6 @@ def translate_job(cfg: dict):
     inplace = bool(tcfg.get('inplace_replace', False))
     strict_line = bool(tcfg.get('strict_line', True))
     delete_translated = bool(tcfg.get('delete_translated_email', False))
-    trash_folder = str(tcfg.get('trash_folder', '') or '').strip()
     # 当 force_retranslate 为 true 时，会跳过 has_linked_reply 幂等检查，用于重新翻译已有邮件
     force_retranslate = bool(tcfg.get('force_retranslate', False))
     max_translate_attempts = max(1, int(tcfg.get('max_retry', 3)))
@@ -1144,10 +1143,10 @@ def translate_job(cfg: dict):
                     mark_seen(c, folder, uid)
                     if delete_translated:
                         try:
-                            dst = move_to_trash(c, folder, uid, trash_folder)
-                            logger.info(f"已移动原始邮件到垃圾箱: {sub} (uid={uid}, folder={dst})")
+                            dst = move_to_junk(c, folder, uid)
+                            logger.info(f"已移动原始邮件到 Junk: {sub} (uid={uid}, folder={dst})")
                         except Exception as e:
-                            logger.info(f"移动原始邮件到垃圾箱失败: {sub} (uid={uid}) -> {e}")
+                            logger.info(f"移动原始邮件到 Junk 失败: {sub} (uid={uid}) -> {e}")
                     continue
 
             # Per-mail memo: reuse successful translations for identical source text
@@ -1265,10 +1264,10 @@ def translate_job(cfg: dict):
             mark_seen(c, target_folder, uid)
             if delete_translated:
                 try:
-                    dst = move_to_trash(c, target_folder, uid, trash_folder)
-                    logger.info(f"已移动原始邮件到垃圾箱: {sub} (uid={uid}, folder={dst})")
+                    dst = move_to_junk(c, target_folder, uid)
+                    logger.info(f"已移动原始邮件到 Junk: {sub} (uid={uid}, folder={dst})")
                 except Exception as e:
-                    logger.info(f"移动原始邮件到垃圾箱失败: {sub} (uid={uid}) -> {e}")
+                    logger.info(f"移动原始邮件到 Junk 失败: {sub} (uid={uid}) -> {e}")
             logger.info(f"已写入翻译邮件: {new_subject}")
     finally:
         try:

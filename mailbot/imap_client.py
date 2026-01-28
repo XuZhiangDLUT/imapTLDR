@@ -3,7 +3,7 @@ from email.parser import BytesParser
 from email import policy
 from email.message import EmailMessage
 from email.utils import make_msgid
-from typing import Iterable
+from typing import Any, Iterable, Sequence
 from itertools import islice
 
 def connect(host: str, user: str, password: str, port: int = 993, ssl: bool = True) -> IMAPClient:
@@ -343,6 +343,122 @@ def move_to_trash(client: IMAPClient, src_folder: str, uid: int, trash_folder: s
     dst = str(trash_folder or "").strip()
     if not dst:
         raise ValueError("translate.trash_folder is empty")
+    move_message(client, src_folder, uid, dst)
+    return dst
+
+
+def _imap_to_str(value: Any) -> str:
+    if isinstance(value, (bytes, bytearray)):
+        try:
+            return value.decode("utf-8")
+        except Exception:
+            return value.decode("utf-8", errors="ignore")
+    return str(value)
+
+
+def _normalize_imap_flag(value: str) -> str:
+    s = _imap_to_str(value).strip()
+    if not s:
+        return s
+    if s.startswith("\\"):
+        return s
+    if s.startswith("/"):
+        return "\\" + s[1:]
+    return s
+
+
+def _list_folders_prefer_xlist(client: IMAPClient) -> list[tuple[list[str], str, str]]:
+    raw = None
+    xlist_fn = getattr(client, "xlist_folders", None)
+    if callable(xlist_fn):
+        try:
+            raw = xlist_fn()
+        except Exception:
+            raw = None
+    if raw is None:
+        raw = client.list_folders()
+    out: list[tuple[list[str], str, str]] = []
+    for flags, delim, name in raw:
+        out.append(
+            (
+                [_imap_to_str(f) for f in (flags or ())],
+                _imap_to_str(delim),
+                _imap_to_str(name),
+            )
+        )
+    return out
+
+
+def find_system_junk_folder(client: IMAPClient) -> str | None:
+    """
+    Best-effort detection of the system Junk/Spam mailbox.
+
+    Preference order:
+    1) XLIST/SPECIAL-USE flags (\\Junk / \\Spam)
+    2) Common names ("Junk", "Spam", "Junk E-mail", etc.)
+    Tie-breakers prefer top-level folders and avoid known QQ manual folders like "其他文件夹/垃圾箱".
+    """
+    candidates: list[tuple[int, str]] = []
+
+    for flags, _delim, name in _list_folders_prefer_xlist(client):
+        n = str(name or "").strip()
+        if not n:
+            continue
+
+        fl = [(_normalize_imap_flag(f) or "").lower() for f in (flags or [])]
+        if "\\noselect" in fl:
+            continue
+
+        nl = n.lower()
+        score = 0
+
+        # Strongest signal: special-use flags (via XLIST or SPECIAL-USE).
+        if "\\junk" in fl:
+            score += 10_000
+        if "\\spam" in fl:
+            score += 9_000
+
+        # Common names.
+        if nl == "junk":
+            score += 800
+        if nl == "spam":
+            score += 700
+        if "junk" in nl:
+            score += 500
+        if "spam" in nl:
+            score += 450
+        if any(k in n for k in ["垃圾", "廣告", "广告", "垃圾箱", "垃圾邮件"]):
+            score += 400
+
+        # Prefer top-level system folders.
+        if "/" not in n and "\\" not in n:
+            score += 200
+        if "其他文件夹" in n or "other" in nl:
+            score -= 200
+
+        # Explicitly avoid a known user-created folder pattern for QQ.
+        if "其他文件夹/垃圾箱" in n:
+            score -= 5_000
+
+        if score > 0:
+            candidates.append((score, n))
+
+    candidates.sort(key=lambda x: x[0], reverse=True)
+
+    for _score, folder in candidates:
+        try:
+            client.select_folder(folder, readonly=True)
+            return folder
+        except Exception:
+            continue
+
+    return None
+
+
+def move_to_junk(client: IMAPClient, src_folder: str, uid: int) -> str:
+    dst = find_system_junk_folder(client)
+    if not dst:
+        raise ValueError("Could not locate system Junk/Spam folder on this IMAP server")
     move_message(client, src_folder, uid, dst)
     return dst
 
