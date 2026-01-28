@@ -259,6 +259,39 @@ def delete_message(client: IMAPClient, folder: str, uid: int, expunge: bool = Tr
             pass
 
 
+def move_message(client: IMAPClient, src_folder: str, uid: int, dst_folder: str):
+    dst = str(dst_folder or "").strip()
+    if not dst:
+        raise ValueError("dst_folder is empty")
+
+    client.select_folder(src_folder)
+
+    # Prefer IMAP MOVE when supported by the server/client
+    move_fn = getattr(client, "move", None)
+    if callable(move_fn):
+        try:
+            move_fn([uid], dst)
+            return
+        except Exception:
+            pass
+
+    # Fallback: COPY + \Deleted + EXPUNGE
+    client.copy([uid], dst)
+    client.add_flags([uid], [b"\\Deleted"])
+    try:
+        client.expunge()
+    except Exception:
+        pass
+
+
+def move_to_trash(client: IMAPClient, src_folder: str, uid: int, trash_folder: str) -> str:
+    dst = str(trash_folder or "").strip()
+    if not dst:
+        raise ValueError("translate.trash_folder is empty")
+    move_message(client, src_folder, uid, dst)
+    return dst
+
+
 def list_unseen(client: IMAPClient, folder: str, exclude_auto_generated: bool = False) -> list[int]:
     client.select_folder(folder)
     if exclude_auto_generated:
