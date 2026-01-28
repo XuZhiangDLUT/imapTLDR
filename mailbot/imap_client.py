@@ -259,6 +259,17 @@ def delete_message(client: IMAPClient, folder: str, uid: int, expunge: bool = Tr
             pass
 
 
+def _uid_exists_in_selected_folder(client: IMAPClient, uid: int) -> bool:
+    try:
+        data = client.fetch([uid], [b"FLAGS"])
+    except Exception:
+        return False
+    try:
+        return isinstance(data, dict) and uid in data
+    except Exception:
+        return False
+
+
 def move_message(client: IMAPClient, src_folder: str, uid: int, dst_folder: str):
     dst = str(dst_folder or "").strip()
     if not dst:
@@ -276,9 +287,53 @@ def move_message(client: IMAPClient, src_folder: str, uid: int, dst_folder: str)
             pass
 
     # Fallback: COPY + \Deleted + EXPUNGE
-    client.copy([uid], dst)
-    client.add_flags([uid], [b"\\Deleted"])
     try:
+        client.copy([uid], dst)
+    except Exception as e_copy:
+        # QQ IMAP: "copy failed: Mails not exist!" typically means the UID is not present
+        # in the currently selected folder. Treat as a no-op if it is already gone.
+        if "Mails not exist" in str(e_copy):
+            try:
+                client.select_folder(src_folder)
+            except Exception:
+                pass
+            if not _uid_exists_in_selected_folder(client, uid):
+                logger.info(
+                    f"move_message: uid missing in src folder, treat as already moved/deleted: folder={src_folder}, uid={uid}"
+                )
+                return
+            # retry once after NOOP, some servers may be briefly inconsistent
+            try:
+                client.noop()
+            except Exception:
+                pass
+            client.copy([uid], dst)
+        else:
+            raise
+
+    try:
+        client.add_flags([uid], [b"\\Deleted"])
+    except Exception as e_del:
+        if "Mails not exist" in str(e_del):
+            try:
+                client.select_folder(src_folder)
+            except Exception:
+                pass
+            if not _uid_exists_in_selected_folder(client, uid):
+                logger.info(
+                    f"move_message: uid missing before delete, treat as already moved/deleted: folder={src_folder}, uid={uid}"
+                )
+                return
+        raise
+    try:
+        # Prefer UID EXPUNGE when supported (limits side effects), fall back to full EXPUNGE.
+        uid_expunge = getattr(client, "uid_expunge", None)
+        if callable(uid_expunge):
+            try:
+                uid_expunge([uid])
+                return
+            except Exception:
+                pass
         client.expunge()
     except Exception:
         pass
