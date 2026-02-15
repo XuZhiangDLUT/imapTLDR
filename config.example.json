@@ -40,6 +40,12 @@
                   },
     "llm":  {
                 "mock":  true,
+                "linuxdo":  {
+                                  "deeplx":  {
+                                                  "api_base":  "https://api.deeplx.org/abcdefghijklmnopqrst",
+                                                  "api_key":  ""
+                                              }
+                              },
                 "siliconflow":  {
                                     "api_base":  "https://api.siliconflow.cn",
                                     "api_key":  "YOUR_SILICONFLOW_API_KEY",

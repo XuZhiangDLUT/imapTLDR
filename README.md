@@ -5,7 +5,7 @@ MailBot 是面向 QQ 邮箱的 IMAP 自动化机器人。它按文件夹扫描�
 ## 核心特性
 
 - **只处理 UNSEEN**：所有操作都基于未读邮件，处理完成自动 mark seen，并把输出写回源文件夹，流程可重复执行。
-- **总结 + 翻译双引擎**：总结支持 DeepSeek (SiliconFlow) 与 Gemini 管道，翻译默认使用 Qwen（可 fallback DeepSeek）。支持 mock LLM 便于离线调试。
+- **总结 + 翻译双引擎**：总结支持 DeepSeek (SiliconFlow) 与 Gemini 管道；翻译支持 Qwen 与 DeepLX（可 fallback DeepSeek）。支持 mock LLM 便于离线调试。
 - **稳健的 HTML 注入**：内置 immersion/inplace 三套注入策略，保证 a/code/pre 等节点不被破坏，可自由切换“原位替换”“行内分段”“全文沉浸”。
 - **速率与并发控制**：翻译任务使用线程池 + 令牌桶控制 RPM/TPM，逐段重试并缓存同一邮件内的重复片段，提升稳定性。
 - **智能调度**：APScheduler 负责任务编排。翻译按“固定延迟”循环，摘要按 Cron 或紧跟翻译执行并具备错过补跑；Ctrl+C 可即时退出。
@@ -104,12 +104,18 @@ run.py                   # CLI 入口，支持 summarize / summarize_job
 
 ### `llm`
 - `mock`: true 时使用 `mailbot.mock_llm`，无需真实 API。
-- `siliconflow` / `bohe`: provider 连接信息 + 模型名称。
+- `siliconflow` / `bohe` / `linuxdo.deeplx`: provider 连接信息 + 模型名称（DeepLX 只需要 `api_base`，`api_key` 可选）。
 - `summarizer_provider`: `"bohe"` 或默认 `"siliconflow"`。
 - `summarizer_model` / `translator_model`: 深度定制模型。
 - `enable_thinking` / `thinking_budget`: DeepSeek/Gemini Thinking 模式控制。
 - `prompt_file`: 摘要提示词文件（默认 `Prompt.txt`）。
 - `request_timeout_seconds`、`summarize_timeout_seconds`、`translate_timeout_seconds`: API 调用超时。
+- DeepLX 切换方式：
+  - 在 `llm.tasks.translate.provider` 中设置为 `"deeplx"`。
+  - `llm.linuxdo.deeplx.api_base` 可填写：
+    - base URL（例如 `https://api.deeplx.org/<token>`，程序会自动补 `/translate`）
+    - 完整 endpoint（例如 `https://api.deeplx.org/<token>/translate`）
+  - `llm.tasks.translate.model` 在 `deeplx` 模式下仅作占位，不参与请求。
 
 ## 运行方式
 

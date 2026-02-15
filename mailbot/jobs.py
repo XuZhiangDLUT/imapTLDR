@@ -9,6 +9,8 @@ import json
 from pathlib import Path as _Path
 from premailer import transform as inline_css
 import re
+import urllib.error
+import urllib.request
 
 logger = logging.getLogger("mailbot")
 
@@ -209,8 +211,8 @@ def _get_llm_task_config(
 
     provider = str(tcfg.get("provider") or default_provider).lower()
 
-    # provider 级别配置：支持 llm.providers.{name} 或老的 llm.{name}
-    providers = llm_cfg.get("providers") or {}
+    # provider 级别配置：优先 llm.linuxdo.{name}，兼容旧 llm.providers.{name} 与 llm.{name}
+    providers = llm_cfg.get("linuxdo") or llm_cfg.get("providers") or {}
     provider_cfg = providers.get(provider) or llm_cfg.get(provider) or cfg.get(provider) or {}
 
     api_base = tcfg.get("api_base") or provider_cfg.get("api_base")
@@ -291,7 +293,7 @@ def preflight_check_llm(cfg: dict) -> bool:
 
     # 收集需要检查的唯一配置组合，避免重复检查
     # 包含 enable_thinking 和 thinking_budget 因为它们会影响 API 行为
-    checked_combos: set[tuple[str, str, str, bool, int]] = set()
+    checked_combos: set[tuple] = set()
     failed_tasks: list[str] = []
 
     for task_name in tasks_cfg.keys():
@@ -315,6 +317,42 @@ def preflight_check_llm(cfg: dict) -> bool:
         provider = task.get("provider") or "unknown"
         enable_thinking = bool(task.get("enable_thinking", False))
         thinking_budget = int(task.get("thinking_budget", 0))
+
+        provider_norm = str(provider).lower()
+
+        if provider_norm == "deeplx":
+            if not api_base:
+                logger.warning(f"LLM 预检: 任务 '{task_name}' 缺少 api_base，跳过")
+                continue
+            combo_key = ("deeplx", str(api_base).strip(), str(api_key).strip())
+            if combo_key in checked_combos:
+                logger.info(f"LLM 预检: 任务 '{task_name}' 与已检查的配置相同，跳过重复检查")
+                continue
+            checked_combos.add(combo_key)
+
+            logger.info(f"LLM 预检: 检查任务 '{task_name}' (provider={provider}, endpoint={api_base})...")
+            try:
+                probe_text = "large language model"
+                response_text = deeplx_translate_single(
+                    str(api_base),
+                    str(api_key),
+                    probe_text,
+                    source_lang="auto",
+                    target_lang="ZH",
+                    timeout=30.0,
+                )
+                if not response_text:
+                    raise ValueError("DeepLX 返回空响应")
+                resp_norm = " ".join((response_text or "").lower().split())
+                probe_norm = " ".join(probe_text.lower().split())
+                # 预检要求：目标语言为中文，响应需含 CJK，且不能与输入完全相同
+                if (not _CJK_RE.search(response_text)) or (resp_norm == probe_norm):
+                    raise ValueError(f"DeepLX 翻译响应校验失败: {response_text[:120]!r}")
+                logger.info(f"LLM 预检: 任务 '{task_name}' 成功 (响应: {response_text[:50]})")
+            except Exception as e:
+                logger.error(f"LLM 预检: 任务 '{task_name}' 失败 - {e}")
+                failed_tasks.append(task_name)
+            continue
 
         if not api_base or not api_key or not model:
             logger.warning(f"LLM 预检: 任务 '{task_name}' 缺少 api_base/api_key/model，跳过")
@@ -878,6 +916,89 @@ def qwen_translate_single(cli: OpenAI, model: str, text: str, timeout: float | i
         return ''
 
 
+def _deeplx_endpoint(api_base: str) -> str:
+    base = (api_base or "").strip()
+    if not base:
+        return ""
+    base = base.rstrip("/")
+    if base.endswith("/translate"):
+        return base
+    return base + "/translate"
+
+
+def _deeplx_lang(lang: str, *, default: str) -> str:
+    v = (lang or "").strip()
+    if not v:
+        return default
+    if v.lower() == "auto":
+        return "auto"
+    return v.upper()
+
+
+def deeplx_translate_single(
+    api_base: str,
+    api_key: str | None,
+    text: str,
+    *,
+    source_lang: str = "auto",
+    target_lang: str = "ZH",
+    timeout: float | int = 30.0,
+) -> str:
+    endpoint = _deeplx_endpoint(api_base)
+    if not endpoint:
+        logger.info("DeepLX endpoint is empty")
+        return ""
+
+    payload = {
+        "text": text or "",
+        "source_lang": _deeplx_lang(source_lang, default="auto"),
+        "target_lang": _deeplx_lang(target_lang, default="ZH"),
+    }
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "User-Agent": "imapTLDR3/1.0 (+https://github.com/mengxi-ream/read-frog)",
+    }
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    req = urllib.request.Request(
+        endpoint,
+        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        headers=headers,
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=float(timeout)) as resp:
+            body = resp.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as e:
+        err = ""
+        try:
+            err = e.read().decode("utf-8", errors="replace").strip()
+        except Exception:
+            err = ""
+        logger.info(f"DeepLX request failed: HTTP {e.code} {e.reason}. {err}")
+        return ""
+    except Exception as e:
+        logger.info(f"DeepLX request failed: {e}")
+        return ""
+
+    try:
+        result = json.loads(body)
+    except Exception as e:
+        logger.info(f"DeepLX response is not valid JSON: {e}")
+        return ""
+
+    for key in ("data", "translation", "result"):
+        val = result.get(key) if isinstance(result, dict) else None
+        if isinstance(val, str):
+            return val.strip()
+
+    logger.info("DeepLX response missing usable translation field")
+    return ""
+
+
 def scan_translate_targets(c, cfg: dict, excluded_prefixes: Iterable[str]):
     translate_cfg = cfg.get('translate', {})
     folders = translate_cfg.get('folders', DEFAULT_TRANSLATE_FOLDERS)
@@ -941,6 +1062,7 @@ def translate_job(cfg: dict):
         default_prompt_file=None,
     )
     use_mock = bool(main_task["mock"])
+    main_provider = str(main_task.get("provider") or "").lower()
     translate_timeout = float(main_task["timeout_seconds"] or 300.0)
     tcfg = cfg.get('translate', {})
     inplace = bool(tcfg.get('inplace_replace', False))
@@ -952,10 +1074,22 @@ def translate_job(cfg: dict):
     rpm_limit = int(tcfg.get('rpm_limit', 1000))
     tpm_limit = int(tcfg.get('tpm_limit', 50000))
     max_workers = int(tcfg.get('concurrency', 6))
+    deeplx_api_base = ""
+    deeplx_api_key = ""
     # 构建主翻译模型客户端 + 兜底翻译模型客户端（可使用不同的链接 / APIKey / 模型）
     if not use_mock:
-        cli = _build_openai_for_task(main_task)
         trans_model = main_task["model"]
+        if main_provider == "deeplx":
+            cli = None
+            deeplx_api_base = str(main_task.get("api_base") or "").strip()
+            deeplx_api_key = str(main_task.get("api_key") or "").strip()
+            if not deeplx_api_base:
+                raise ValueError(
+                    "No DeepLX provider configured for task 'translate' "
+                    "(missing api_base)"
+                )
+        else:
+            cli = _build_openai_for_task(main_task)
 
         # 兜底翻译任务配置：完全解耦主翻译模型
         fallback_task = _get_llm_task_config(
@@ -987,7 +1121,7 @@ def translate_job(cfg: dict):
                 fallback_cli = cli
 
         logger.info(
-            f"机器翻译 LLM 配置: 主模型={trans_model}, 提供商={main_task['provider']}, "
+            f"机器翻译 LLM 配置: 主模型={trans_model or '(n/a)'}, 提供商={main_task['provider']}, "
             f"兜底模型={fallback_model or '(none)'}"
         )
     else:
@@ -1032,13 +1166,22 @@ def translate_job(cfg: dict):
         tok_bucket = TokenBucket(capacity=float(tpm_limit), refill_per_sec=float(tpm_limit) / 60.0)
 
         def do_one(idx: int, seg: str) -> tuple[int, str]:
+            req_bucket.acquire(1.0)
+            if main_provider == "deeplx":
+                out = deeplx_translate_single(
+                    deeplx_api_base,
+                    deeplx_api_key,
+                    seg,
+                    source_lang="auto",
+                    target_lang="ZH",
+                    timeout=translate_timeout,
+                )
+                return idx, out
             # estimate tokens (rough) for limit accounting
             try:
                 est_tokens = max(1, int(rough_token_count(seg) + 64))
             except Exception:
                 est_tokens = 128
-            # acquire rate limits
-            req_bucket.acquire(1.0)
             tok_bucket.acquire(float(est_tokens))
             out = qwen_translate_single(cli, trans_model, seg, timeout=translate_timeout)
             return idx, out
@@ -1064,7 +1207,7 @@ def translate_job(cfg: dict):
         pending = list(range(len(batch)))
         outs = [''] * len(batch)
         attempt = 0
-        # 先使用主翻译模型（通常是 Qwen）进行多轮重试
+        # 先使用主翻译模型进行多轮重试
         while pending and attempt < max_translate_attempts:
             attempt += 1
             sub_batch = [batch[i] for i in pending]
