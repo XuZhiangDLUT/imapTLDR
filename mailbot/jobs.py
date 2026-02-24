@@ -232,6 +232,141 @@ def _extract_plain_for_summary(html: str | None, txt: str | None) -> str:
     return cleaned[0]
 
 
+def _parse_articles_from_text_summary(text: str | None) -> list[dict]:
+    """Parse semi-structured plain-text summary into article cards.
+
+    Works with outputs like:
+      中文标题：...
+      English Title: ...
+      Authors: ...
+      要点：
+      - ...
+      相关性：...
+      ---
+    """
+    if not text:
+        return []
+
+    lines_raw = [(l or "").strip() for l in str(text).splitlines()]
+    lines = [l for l in lines_raw if l]
+    if not lines:
+        return []
+
+    def _new_article() -> dict:
+        return {
+            "title_zh": "",
+            "title_en": "",
+            "authors": "",
+            "bullets": [],
+            "relevance": "",
+        }
+
+    def _norm_line(l: str) -> str:
+        # strip common bullet markers / list markers
+        l = re.sub(r"^[\-\*•◦·]+\s*", "", l)
+        l = re.sub(r"^\d+[\.)]\s*", "", l)
+        return l.strip()
+
+    articles: list[dict] = []
+    cur: dict | None = None
+    in_bullets = False
+
+    def _flush():
+        nonlocal cur, in_bullets
+        if not isinstance(cur, dict):
+            cur = None
+            in_bullets = False
+            return
+        # normalize bullets
+        b = [str(x).strip() for x in (cur.get("bullets") or []) if str(x).strip()]
+        cur["bullets"] = b[:3]
+        ok = bool(
+            str(cur.get("title_zh") or "").strip()
+            or str(cur.get("title_en") or "").strip()
+            or str(cur.get("authors") or "").strip()
+            or cur.get("bullets")
+        )
+        if ok:
+            articles.append(cur)
+        cur = None
+        in_bullets = False
+
+    for raw in lines:
+        line = _norm_line(raw)
+        low = line.lower()
+
+        # section separator
+        if re.fullmatch(r"[-—]{3,}", line):
+            _flush()
+            continue
+
+        # start a new card when title appears
+        if line.startswith("中文标题"):
+            # if a card is already active, flush then start next
+            if cur is not None:
+                _flush()
+            cur = _new_article()
+            in_bullets = False
+            parts = re.split(r"[：:]", line, maxsplit=1)
+            if len(parts) == 2:
+                cur["title_zh"] = parts[1].strip()
+            continue
+
+        # Ignore lines before first card starts
+        if cur is None:
+            continue
+
+        if low.startswith("english title"):
+            parts = re.split(r"[：:]", line, maxsplit=1)
+            if len(parts) == 2:
+                cur["title_en"] = parts[1].strip()
+            in_bullets = False
+            continue
+
+        if low.startswith("authors"):
+            parts = re.split(r"[：:]", line, maxsplit=1)
+            if len(parts) == 2:
+                cur["authors"] = parts[1].strip()
+            in_bullets = False
+            continue
+
+        if line.startswith("要点"):
+            in_bullets = True
+            continue
+
+        if line.startswith("相关性"):
+            parts = re.split(r"[：:]", line, maxsplit=1)
+            if len(parts) == 2:
+                cur["relevance"] = parts[1].strip()
+            in_bullets = False
+            continue
+
+        # default line handling
+        if in_bullets:
+            if line and not line.startswith("http"):
+                cur.setdefault("bullets", []).append(line)
+        else:
+            # If model wrapped title in next line, append conservatively.
+            if not cur.get("title_en") and re.search(r"[A-Za-z]", line) and len(line) < 240:
+                cur["title_en"] = line
+
+    _flush()
+
+    # de-duplicate by title_en/title_zh
+    uniq: list[dict] = []
+    seen: set[str] = set()
+    for a in articles:
+        key = (str(a.get("title_en") or "").strip() or str(a.get("title_zh") or "").strip()).lower()
+        if not key:
+            continue
+        if key in seen:
+            continue
+        seen.add(key)
+        uniq.append(a)
+
+    return uniq
+
+
 def _segment_needs_translation(text: str | None) -> bool:
     """Heuristic: translate only segments that contain ASCII letters."""
     if not text:
@@ -893,9 +1028,18 @@ def summarize_job(cfg: dict):
                     pairs.append((uid, msg, cards_html))
                 else:
                     _txt = ('\n\n'.join(answers_texts)).strip()
-                    if not _txt:
-                        _txt = "<div style=\"color:#888;\">本次 Alert 中的论文与当前研究方向相关性较低，未推荐具体文章。</div>"
-                    pairs.append((uid, msg, _txt))
+                    parsed_text_articles = _parse_articles_from_text_summary(_txt)
+                    if parsed_text_articles:
+                        logger.info(f"文本总结解析为结构化卡片成功: {sub} (uid={uid}), cards={len(parsed_text_articles)}")
+                        cards_html = ''.join([
+                            f"<div style=\"border:1px solid #e5e7eb;border-radius:10px;padding:10px 12px;margin:10px 0;\"><div style=\"font-weight:700;font-size:15px;line-height:1.35;margin-bottom:6px;\"><span style=\"color:#111827;\">中文标题：</span><span style=\"color:#111827;\">{(a.get('title_zh') or '').strip()}</span></div><div style=\"font-size:12px;color:#374151;margin-bottom:4px;\">English Title: {(a.get('title_en') or '').strip()}</div><div style=\"font-size:12px;color:#6b7280;margin-bottom:6px;\">Authors: {(a.get('authors') or '').strip()}</div><div><div style=\"font-weight:600;color:#111827;margin-bottom:4px;\">要点</div><ul style=\"margin:0;padding-left:18px;\">{''.join(f'<li>{b}</li>' for b in (a.get('bullets') or []) if (b or '').strip())}</ul><div style=\"font-size:12px;color:#059669;margin-top:6px;\">相关性：{(a.get('relevance') or '').strip()}</div></div></div>"
+                            for a in parsed_text_articles[:12]
+                        ])
+                        pairs.append((uid, msg, cards_html))
+                    else:
+                        if not _txt:
+                            _txt = "<div style=\"color:#888;\">本次 Alert 中的论文与当前研究方向相关性较低，未推荐具体文章。</div>"
+                        pairs.append((uid, msg, _txt))
 
             for i in range(0, len(pairs), batch_size):
                 batch = pairs[i:i+batch_size]
