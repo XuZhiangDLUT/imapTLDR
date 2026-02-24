@@ -232,6 +232,54 @@ def _extract_plain_for_summary(html: str | None, txt: str | None) -> str:
     return cleaned[0]
 
 
+def _safe_json_parse(text: str | None):
+    """Best-effort JSON parse for LLM outputs.
+
+    Supports raw JSON and fenced blocks like:
+    ```json
+    {...}
+    ```
+    """
+    if not text:
+        return None
+    s = str(text).strip()
+    if not s:
+        return None
+
+    candidates: list[str] = [s]
+
+    # Strip markdown fences
+    if s.startswith("```") and s.endswith("```"):
+        inner = re.sub(r"^```(?:json|JSON)?\s*", "", s)
+        inner = re.sub(r"\s*```$", "", inner)
+        candidates.append(inner.strip())
+
+    # If fenced block is embedded with extra text, try extract first fenced block
+    m = re.search(r"```(?:json|JSON)?\s*(.*?)\s*```", s, flags=re.S)
+    if m:
+        candidates.append((m.group(1) or "").strip())
+
+    # Try object/array substring extraction
+    lcur, rcur = s.find("{"), s.rfind("}")
+    if lcur != -1 and rcur != -1 and rcur > lcur:
+        candidates.append(s[lcur:rcur + 1].strip())
+    lbr, rbr = s.find("["), s.rfind("]")
+    if lbr != -1 and rbr != -1 and rbr > lbr:
+        candidates.append(s[lbr:rbr + 1].strip())
+
+    seen: set[str] = set()
+    for c in candidates:
+        if not c or c in seen:
+            continue
+        seen.add(c)
+        try:
+            import json as _json
+            return _json.loads(c)
+        except Exception:
+            continue
+    return None
+
+
 def _parse_articles_from_text_summary(text: str | None) -> list[dict]:
     """Parse semi-structured plain-text summary into article cards.
 
@@ -916,12 +964,7 @@ def summarize_job(cfg: dict):
                             else:
                                 logger.warning(f"兜底模型总结也失败了")
                         # try parse json articles
-                        parsed = None
-                        try:
-                            import json as _json
-                            parsed = _json.loads(summary)
-                        except Exception:
-                            parsed = None
+                        parsed = _safe_json_parse(summary)
                     # record payload + model outputs
                     actual_model = fallback_model if used_fallback else model
                     entry: dict = {
