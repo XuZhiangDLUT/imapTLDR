@@ -155,6 +155,83 @@ _CJK_RE = re.compile(r"[\u4e00-\u9fff]")
 _ASCII_RE = re.compile(r"[A-Za-z]")
 
 
+def _extract_plain_for_summary(html: str | None, txt: str | None) -> str:
+    """Extract cleaner plain text for summarization from email parts.
+
+    Why: many newsletter HTML bodies contain massive CSS/template noise.
+    Feeding raw `soup.get_text()` can overwhelm the model and lead to
+    malformed outputs (e.g. meaningless numeric lists).
+    """
+    candidates: list[str] = []
+
+    if html:
+        try:
+            soup = BeautifulSoup(html, "html5lib")
+            for tag in soup(["style", "script", "noscript", "head", "title", "meta", "link"]):
+                try:
+                    tag.decompose()
+                except Exception:
+                    pass
+            candidates.append(soup.get_text("\n", strip=True))
+        except Exception:
+            pass
+
+    if txt:
+        candidates.append(txt)
+
+    def _clean_lines(s: str) -> str:
+        out: list[str] = []
+        prev = None
+        for raw in (s or "").splitlines():
+            line = (raw or "").strip()
+            if not line:
+                continue
+            low = line.lower()
+
+            # Drop CSS/template noise and raw HTML fragments.
+            if line in {"{", "}", ";"}:
+                continue
+            if low.startswith("@media "):
+                continue
+            if re.match(r"^[.#@]?[a-z0-9_-]+\s*\{", low):
+                continue
+            if re.match(r"^[a-z-]+\s*:\s*.+;?$", low) and any(k in low for k in (
+                "font", "padding", "margin", "color", "width", "height", "display", "line-height"
+            )):
+                continue
+            if re.match(r"^</?[^>]+>$", line):
+                continue
+            if "<" in line and ">" in line and ("style=" in low or "href=" in low):
+                continue
+
+            # De-duplicate consecutive identical lines.
+            if line == prev:
+                continue
+            out.append(line)
+            prev = line
+
+        return "\n".join(out)
+
+    cleaned: list[str] = []
+    for c in candidates:
+        cc = _clean_lines(c)
+        if cc.strip():
+            cleaned.append(cc)
+
+    if not cleaned:
+        return ""
+
+    def _score(s: str) -> float:
+        total = max(len(s), 1)
+        alpha = sum(ch.isalpha() for ch in s)
+        cjk = sum(1 for ch in s if "\u4e00" <= ch <= "\u9fff")
+        brace = s.count("{") + s.count("}")
+        return (alpha + 2 * cjk) / total - (brace / max(total, 2000))
+
+    cleaned.sort(key=_score, reverse=True)
+    return cleaned[0]
+
+
 def _segment_needs_translation(text: str | None) -> bool:
     """Heuristic: translate only segments that contain ASCII letters."""
     if not text:
@@ -643,7 +720,10 @@ def summarize_job(cfg: dict):
                     continue
                 logger.info(f"待总结邮件: {sub} (uid={uid})")
                 html, txt = pick_html_or_text(msg)
-                plain = BeautifulSoup(html, 'html5lib').get_text('\n', strip=True) if html else (txt or '')
+                plain = _extract_plain_for_summary(html, txt)
+                logger.info(
+                    f"总结文本提取: html_chars={len(html or '')}, txt_chars={len(txt or '')}, cleaned_chars={len(plain)}"
+                )
                 if not plain:
                     mark_seen(c, folder, uid)
                     continue
