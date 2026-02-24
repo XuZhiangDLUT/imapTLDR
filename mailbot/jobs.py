@@ -133,6 +133,7 @@ from .imap_client import (
     build_email,
     append_unseen,
     mark_seen,
+    mark_unseen,
     move_to_junk,
     has_linked_reply,
 )
@@ -655,6 +656,8 @@ def summarize_job(cfg: dict):
                 )
                 answers_texts: list[str] = []
                 aggregated_articles: list[dict] = []
+                summary_output_valid = True
+                invalid_reasons: list[str] = []
                 for idx, ch in enumerate(chunks):
                     c_chars = len(ch)
                     c_tokens = rough_token_count(ch)
@@ -746,18 +749,54 @@ def summarize_job(cfg: dict):
                             articles = parsed.get('articles')
                         reason = (parsed.get('no_match_reason') or "").strip()
                     elif isinstance(parsed, list):
-                        # Treat a top-level list as article list when items are dict-like
+                        # Treat a top-level list as article list only when items are dict-like
                         if all(isinstance(a, dict) for a in parsed):
                             articles = parsed
+                        else:
+                            summary_output_valid = False
+                            invalid_reasons.append(f"root-list-nondict(len={len(parsed)})")
 
                     if isinstance(articles, list):
-                        # accumulate articles for this message
-                        aggregated_articles.extend([a for a in articles if isinstance(a, dict)])
-                        # allow模型在无相关文章时给出整体原因说明
-                        if reason:
-                            answers_texts.append(reason)
+                        # Keep only article dicts with meaningful fields; drop empty placeholders.
+                        cleaned_articles: list[dict] = []
+                        for a in articles:
+                            if not isinstance(a, dict):
+                                continue
+                            tzh = str(a.get('title_zh') or '').strip()
+                            ten = str(a.get('title_en') or '').strip()
+                            authors = str(a.get('authors') or '').strip()
+                            bullets_raw = a.get('bullets')
+                            bullets_ok = isinstance(bullets_raw, list) and any(str(b or '').strip() for b in bullets_raw)
+                            if tzh or ten or authors or bullets_ok:
+                                cleaned_articles.append(a)
+
+                        if cleaned_articles:
+                            # accumulate articles for this message
+                            aggregated_articles.extend(cleaned_articles)
+                            # allow模型在无相关文章时给出整体原因说明
+                            if reason:
+                                answers_texts.append(reason)
+                        else:
+                            summary_output_valid = False
+                            invalid_reasons.append("articles-empty-fields")
                     else:
+                        # Detect clearly unusable pseudo-JSON output such as [2026]
+                        st = (summary or "").strip()
+                        if parsed is not None and re.fullmatch(r"\[\s*(\d+\s*,\s*)*\d+\s*\]", st):
+                            summary_output_valid = False
+                            invalid_reasons.append("numeric-list-summary")
                         answers_texts.append(summary)
+
+                if not summary_output_valid:
+                    logger.warning(
+                        f"总结输出格式异常，跳过生成总结邮件并保留原邮件未读以便重试: {sub} (uid={uid}) | reasons={','.join(invalid_reasons) or 'unknown'}"
+                    )
+                    try:
+                        mark_unseen(c, folder, uid)
+                    except Exception:
+                        pass
+                    continue
+
                 # prefer JSON-rendered cards when available
                 if aggregated_articles:
                     # dedupe by English title to avoid duplicates across chunks
