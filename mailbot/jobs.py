@@ -735,11 +735,25 @@ def summarize_job(cfg: dict):
                             if key in meta_extra and meta_extra[key] is not None:
                                 entry[key] = meta_extra[key]
                     submitted_entries.append(entry)
-                    if parsed and isinstance(parsed.get('articles'), list):
-                        # accumulate articles for this message
-                        aggregated_articles.extend([a for a in parsed['articles'] if isinstance(a, dict)])
-                        # allow模型在无相关文章时给出整体原因说明
+
+                    # Normalize parsed output shape:
+                    # - expected: {"articles": [...], "no_match_reason": "..."}
+                    # - observed in the wild: [...] (list as root)
+                    articles = None
+                    reason = ""
+                    if isinstance(parsed, dict):
+                        if isinstance(parsed.get('articles'), list):
+                            articles = parsed.get('articles')
                         reason = (parsed.get('no_match_reason') or "").strip()
+                    elif isinstance(parsed, list):
+                        # Treat a top-level list as article list when items are dict-like
+                        if all(isinstance(a, dict) for a in parsed):
+                            articles = parsed
+
+                    if isinstance(articles, list):
+                        # accumulate articles for this message
+                        aggregated_articles.extend([a for a in articles if isinstance(a, dict)])
+                        # allow模型在无相关文章时给出整体原因说明
                         if reason:
                             answers_texts.append(reason)
                     else:
