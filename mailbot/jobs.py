@@ -437,12 +437,30 @@ def _looks_translated(src: str | None, dst: str | None) -> bool:
     return bool(src_norm) and dst != src_norm
 
 
-def new_openai(api_base: str, api_key: str, timeout: float | int = 15.0) -> OpenAI:
+def new_openai(
+    api_base: str,
+    api_key: str,
+    timeout: float | int = 15.0,
+    *,
+    headers: dict | None = None,
+    auth_header: bool = True,
+) -> OpenAI:
     base = api_base.rstrip('/')
     if not base.endswith('/v1'):
         base += '/v1'
-    logger.info(f"初始化 LLM 客户端: base={base}")
-    return OpenAI(base_url=base, api_key=api_key, timeout=timeout)
+
+    safe_headers = headers if isinstance(headers, dict) else None
+    has_headers = bool(safe_headers)
+    logger.info(f"初始化 LLM 客户端: base={base}, auth_header={auth_header}, headers={has_headers}")
+
+    # OpenAI Python SDK 默认会携带 Authorization: Bearer <api_key>。
+    # 这里通过 default_headers 透传自定义头（如 User-Agent）以兼容被上游风控拦截的场景。
+    return OpenAI(
+        base_url=base,
+        api_key=api_key,
+        timeout=timeout,
+        default_headers=safe_headers,
+    )
 
 
 def _get_llm_task_config(
@@ -480,6 +498,11 @@ def _get_llm_task_config(
     api_key = tcfg.get("api_key") or provider_cfg.get("api_key")
     model = tcfg.get("model") or provider_cfg.get("model") or default_model
 
+    provider_headers = provider_cfg.get("headers") if isinstance(provider_cfg.get("headers"), dict) else {}
+    task_headers = tcfg.get("headers") if isinstance(tcfg.get("headers"), dict) else {}
+    merged_headers = {**provider_headers, **task_headers} if (provider_headers or task_headers) else None
+    auth_header = bool(tcfg.get("authHeader", provider_cfg.get("authHeader", True)))
+
     if global_timeout_key:
         base_timeout = float(
             llm_cfg.get(global_timeout_key, llm_cfg.get("request_timeout_seconds", default_timeout))
@@ -502,6 +525,8 @@ def _get_llm_task_config(
         "api_key": api_key,
         "model": model,
         "timeout_seconds": timeout_seconds,
+        "headers": merged_headers,
+        "auth_header": auth_header,
         "enable_thinking": enable_thinking,
         "thinking_budget": thinking_budget,
         "expect_json": expect_json,
@@ -527,7 +552,9 @@ def _build_openai_for_task(task_cfg: dict) -> OpenAI | None:
             "(missing api_base or api_key)"
         )
     timeout = float(task_cfg.get("timeout_seconds") or 15.0)
-    return new_openai(str(api_base), str(api_key), timeout=timeout)
+    headers = task_cfg.get("headers") if isinstance(task_cfg.get("headers"), dict) else None
+    auth_header = bool(task_cfg.get("auth_header", True))
+    return new_openai(str(api_base), str(api_key), timeout=timeout, headers=headers, auth_header=auth_header)
 
 
 def preflight_check_llm(cfg: dict) -> bool:
@@ -578,6 +605,8 @@ def preflight_check_llm(cfg: dict) -> bool:
         provider = task.get("provider") or "unknown"
         enable_thinking = bool(task.get("enable_thinking", False))
         thinking_budget = int(task.get("thinking_budget", 0))
+        headers = task.get("headers") if isinstance(task.get("headers"), dict) else None
+        auth_header = bool(task.get("auth_header", True))
 
         provider_norm = str(provider).lower()
 
@@ -619,17 +648,28 @@ def preflight_check_llm(cfg: dict) -> bool:
             logger.warning(f"LLM 预检: 任务 '{task_name}' 缺少 api_base/api_key/model，跳过")
             continue
 
-        combo_key = (api_base, model, api_key, enable_thinking, thinking_budget)
+        combo_key = (
+            api_base,
+            model,
+            api_key,
+            enable_thinking,
+            thinking_budget,
+            auth_header,
+            tuple(sorted((headers or {}).items())),
+        )
         if combo_key in checked_combos:
             logger.info(f"LLM 预检: 任务 '{task_name}' 与已检查的配置相同，跳过重复检查")
             continue
         checked_combos.add(combo_key)
 
         thinking_desc = f"thinking={enable_thinking}" + (f", budget={thinking_budget}" if enable_thinking else "")
-        logger.info(f"LLM 预检: 检查任务 '{task_name}' (provider={provider}, model={model}, {thinking_desc})...")
+        header_desc = f", auth_header={auth_header}, headers={bool(headers)}"
+        logger.info(
+            f"LLM 预检: 检查任务 '{task_name}' (provider={provider}, model={model}, {thinking_desc}{header_desc})..."
+        )
 
         try:
-            cli = new_openai(api_base, api_key, timeout=30.0)
+            cli = new_openai(api_base, api_key, timeout=30.0, headers=headers, auth_header=auth_header)
 
             # 构建与任务相同的 extra_body 参数
             extra: dict = {}

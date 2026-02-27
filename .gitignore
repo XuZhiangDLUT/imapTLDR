@@ -16,6 +16,9 @@ venv/
 *.env
 config.json
 config.backup.json
+config.json.backup.*
+requirements.lock.txt
+.venv.bak-*/
 
 # Generated artifacts
 folders.txt
