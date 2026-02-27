@@ -500,6 +500,11 @@ def _get_llm_task_config(
     api_base = tcfg.get("api_base") or provider_cfg.get("api_base")
     api_key = tcfg.get("api_key") or provider_cfg.get("api_key")
     model = tcfg.get("model") or provider_cfg.get("model") or default_model
+    if isinstance(model, str):
+        model = model.strip()
+    # Zhipu model ids are lowercase in official docs (e.g. glm-5).
+    if provider == "zhipu" and isinstance(model, str):
+        model = model.lower()
 
     provider_headers = provider_cfg.get("headers") if isinstance(provider_cfg.get("headers"), dict) else {}
     task_headers = tcfg.get("headers") if isinstance(tcfg.get("headers"), dict) else {}
@@ -558,6 +563,48 @@ def _build_openai_for_task(task_cfg: dict) -> OpenAI | None:
     headers = task_cfg.get("headers") if isinstance(task_cfg.get("headers"), dict) else None
     auth_header = bool(task_cfg.get("auth_header", True))
     return new_openai(str(api_base), str(api_key), timeout=timeout, headers=headers, auth_header=auth_header)
+
+
+def _build_reasoning_extra(
+    provider: str,
+    model: str,
+    enable_thinking: bool,
+    thinking_budget: int,
+) -> dict:
+    """
+    Build provider-specific reasoning/thinking request fields.
+
+    - DeepSeek/SiliconFlow style: enable_thinking + thinking_budget
+    - Zhipu GLM style: thinking.type = enabled/disabled
+    - Gemini bridge: generationConfig.thinkingConfig.thinkingBudget
+    """
+    provider_norm = str(provider or "").lower()
+    model_name = str(model or "")
+    extra: dict = {}
+
+    if provider_norm == "zhipu":
+        extra["thinking"] = {"type": "enabled" if enable_thinking else "disabled"}
+    elif enable_thinking:
+        extra["enable_thinking"] = True
+        extra["thinking_budget"] = thinking_budget
+
+    if enable_thinking and (
+        model_name.startswith("gemini-2.5")
+        or model_name.startswith("gemini-3")
+        or model_name.startswith("gemini-")
+    ):
+        try:
+            budget = int(thinking_budget)
+        except Exception:
+            budget = -1
+        gen_cfg = extra.get("generationConfig") or {}
+        think_cfg = gen_cfg.get("thinkingConfig") or {}
+        # -1 means dynamic thinking budget per Gemini docs
+        think_cfg["thinkingBudget"] = budget
+        gen_cfg["thinkingConfig"] = think_cfg
+        extra["generationConfig"] = gen_cfg
+
+    return extra
 
 
 def preflight_check_llm(cfg: dict) -> bool:
@@ -674,18 +721,8 @@ def preflight_check_llm(cfg: dict) -> bool:
         try:
             cli = new_openai(api_base, api_key, timeout=30.0, headers=headers, auth_header=auth_header)
 
-            # 构建与任务相同的 extra_body 参数
-            extra: dict = {}
-            if enable_thinking:
-                extra["enable_thinking"] = True
-                extra["thinking_budget"] = thinking_budget
-                # Gemini 2.5+ 的 thinking 配置
-                if model.startswith("gemini-2.5") or model.startswith("gemini-3") or model.startswith("gemini-"):
-                    gen_cfg = extra.get("generationConfig") or {}
-                    think_cfg = gen_cfg.get("thinkingConfig") or {}
-                    think_cfg["thinkingBudget"] = thinking_budget if thinking_budget >= 0 else -1
-                    gen_cfg["thinkingConfig"] = think_cfg
-                    extra["generationConfig"] = gen_cfg
+            # 构建与任务相同的 extra_body 参数（provider-aware）
+            extra = _build_reasoning_extra(provider, model, enable_thinking, thinking_budget)
 
             # 发送测试请求，使用与任务相同的参数（不限制 max_tokens，与正常任务一致）
             r = cli.chat.completions.create(
@@ -719,6 +756,7 @@ def deepseek_summarize(
     thinking_budget: int,
     timeout: float | int = 15.0,
     expect_json: bool = False,
+    provider: str = "",
 ) -> tuple[str, str, dict]:
     """Generic summarize helper for OpenAI-compatible backends (DeepSeek / Gemini).
 
@@ -726,26 +764,11 @@ def deepseek_summarize(
     specific fields (e.g. usage, reasoning token counts) for JSON logging.
 
     - For DeepSeek-like models, passes `enable_thinking` / `thinking_budget` directly.
+    - For Zhipu GLM, maps to `thinking: {"type": "enabled|disabled"}`.
     - For Gemini 2.5 models on x666, maps `thinking_budget` to `generationConfig.thinkingConfig.thinkingBudget`.
     """
-    extra: dict = {}
+    extra = _build_reasoning_extra(provider, model, enable_thinking, thinking_budget)
     meta: dict = {}
-    if enable_thinking:
-        # DeepSeek / SiliconFlow style flags (ignored by Gemini backends).
-        extra["enable_thinking"] = enable_thinking
-        extra["thinking_budget"] = thinking_budget
-        # Gemini thinking config (OpenAI-compatible -> Gemini bridge)
-        if model.startswith("gemini-2.5") or model.startswith("gemini-3") or model.startswith("gemini-"):
-            try:
-                budget = int(thinking_budget)
-            except Exception:
-                budget = -1
-            gen_cfg = extra.get("generationConfig") or {}
-            think_cfg = gen_cfg.get("thinkingConfig") or {}
-            # -1 means dynamic thinking budget per Gemini docs
-            think_cfg["thinkingBudget"] = budget
-            gen_cfg["thinkingConfig"] = think_cfg
-            extra["generationConfig"] = gen_cfg
     if expect_json:
         try:
             # Many OpenAI-compatible providers support JSON mode via response_format
@@ -985,6 +1008,7 @@ def summarize_job(cfg: dict):
                             thinking_budget,
                             timeout=summarize_timeout,
                             expect_json=bool(task.get("expect_json", True)),
+                            provider=provider_kind,
                         )
                         # 检测主模型是否超时或出错，若有 fallback 模型则使用兜底
                         if "(summary timeout or error)" in summary and fallback_model and fallback_cli:
@@ -1000,6 +1024,7 @@ def summarize_job(cfg: dict):
                                 fallback_thinking_budget,
                                 timeout=fallback_timeout,
                                 expect_json=bool(fallback_task.get("expect_json", True)),
+                                provider=str(fallback_task.get("provider") or provider_kind),
                             )
                             used_fallback = True
                             if "(summary timeout or error)" not in summary:
