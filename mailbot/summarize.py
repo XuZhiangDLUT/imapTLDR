@@ -1,4 +1,3 @@
-from .llm import LLMClient
 from .imap_client import (
     connect,
     search_unseen_without_prefix,
@@ -77,10 +76,37 @@ def summarize_once(cfg: dict, folder: str | None = None, batch: int = 5):
         prompt_path = Path(task.get("prompt_file") or "Prompt.txt")
         prompt = prompt_path.read_text(encoding="utf-8") if prompt_path.exists() else "Summarize in Chinese."
         cli = _build_openai_for_task(task)
+
+        # 手动一次性总结的兜底模型配置（与 summarize_job 保持一致）
+        fallback_task = _get_llm_task_config(
+            cfg,
+            "summarize_fallback",
+            default_provider=provider_kind,
+            default_model="",
+            global_timeout_key="summarize_timeout_seconds",
+            default_timeout=timeout,
+            default_enable_thinking=True,
+            default_thinking_budget=8192,
+            default_expect_json=bool(task.get("expect_json", True)),
+            default_prompt_file=task.get("prompt_file") or "Prompt.txt",
+        )
+        fallback_model = fallback_task["model"]
+        fallback_enable_thinking = bool(fallback_task["enable_thinking"])
+        fallback_thinking_budget = int(fallback_task["thinking_budget"])
+        fallback_timeout = float(fallback_task["timeout_seconds"] or timeout)
+        fallback_cli = None
+        if fallback_model and not use_mock:
+            try:
+                fallback_cli = _build_openai_for_task(fallback_task)
+            except ValueError:
+                # 兜底任务若缺少凭据，回退到主客户端 + 兜底模型名
+                fallback_cli = cli
+
         if not use_mock:
             logger.info(
                 f"Summarize-once LLM configured: provider={provider_kind}, model={model}, "
-                f"enable_thinking={enable_thinking}, thinking_budget={thinking_budget}"
+                f"enable_thinking={enable_thinking}, thinking_budget={thinking_budget}, "
+                f"fallback_model={fallback_model or '(none)'}"
             )
         else:
             logger.info("Summarize-once LLM configured: mock mode enabled (no external LLM calls)")
@@ -131,15 +157,14 @@ def summarize_once(cfg: dict, folder: str | None = None, batch: int = 5):
             logger.info(f"Summarize-once plan: total chars={total_chars}, ~tokens={total_tokens} → snippet chars={sn_chars}, ~tokens={sn_tokens}")
             # call model and record outputs
             meta_extra: dict = {}
+            used_fallback = False
+            used_model = model
+            used_enable_thinking = enable_thinking
+            used_thinking_budget = thinking_budget
+
             if use_mock:
-                summ, thinking, meta_extra = (
-                    LLMClient(provider["api_base"], provider["api_key"], model, timeout=timeout).summarize(
-                        snippet, lang="zh-CN"
-                    ),
-                    "",
-                    {},
-                )
-                parsed = None
+                # mock 模式仅使用本地模拟摘要
+                summ, thinking, meta_extra = ("- mock summary", "", {})
             else:
                 summ, thinking, meta_extra = deepseek_summarize(
                     cli,
@@ -151,12 +176,34 @@ def summarize_once(cfg: dict, folder: str | None = None, batch: int = 5):
                     timeout=timeout,
                     expect_json=bool(task.get("expect_json", True)),
                 )
-                try:
-                    import json as _json
 
-                    parsed = _json.loads(summ)
-                except Exception:
-                    parsed = None
+                # 主模型失败时，尝试 summarize_fallback
+                if summ == "(summary timeout or error)" and fallback_model and fallback_cli is not None:
+                    logger.warning(f"Summarize-once 主模型失败，尝试兜底模型: {fallback_model}")
+                    fsumm, fthinking, fmeta = deepseek_summarize(
+                        fallback_cli,
+                        fallback_model,
+                        prompt,
+                        snippet,
+                        fallback_enable_thinking,
+                        fallback_thinking_budget,
+                        timeout=fallback_timeout,
+                        expect_json=bool(fallback_task.get("expect_json", task.get("expect_json", True))),
+                    )
+                    if fsumm != "(summary timeout or error)":
+                        summ, thinking, meta_extra = fsumm, fthinking, (fmeta or {})
+                        used_fallback = True
+                        used_model = fallback_model
+                        used_enable_thinking = fallback_enable_thinking
+                        used_thinking_budget = fallback_thinking_budget
+                        logger.info("Summarize-once 兜底模型总结成功")
+
+            try:
+                import json as _json
+
+                parsed = _json.loads(summ)
+            except Exception:
+                parsed = None
             # record single-chunk payload for summarize_once
             entry: dict = {
                 "job": "summarize_once",
@@ -169,9 +216,10 @@ def summarize_once(cfg: dict, folder: str | None = None, batch: int = 5):
                 "chars": sn_chars,
                 "approx_tokens": sn_tokens,
                 "prompt": prompt,
-                "model": model,
-                "enable_thinking": bool(enable_thinking),
-                "thinking_budget": int(thinking_budget),
+                "model": used_model,
+                "enable_thinking": bool(used_enable_thinking),
+                "thinking_budget": int(used_thinking_budget),
+                "used_fallback": bool(used_fallback),
                 "thinking": thinking,
                 "answer": summ,
                 "when": datetime.now().isoformat(timespec='seconds'),

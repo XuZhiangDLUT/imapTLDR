@@ -1,12 +1,13 @@
 from typing import Iterable
+import re
 from openai import OpenAI
 
 
 class LLMClient:
     def __init__(self, base_url: str, api_key: str, model: str, timeout: float | int = 15.0):
-        # SiliconFlow uses OpenAI-compatible interface
+        # OpenAI-compatible interface, 支持 /v1 与 /v4
         base = base_url.rstrip("/")
-        if not base.endswith("/v1"):
+        if not re.search(r"/v\d+$", base):
             base = base + "/v1"
         self.client = OpenAI(base_url=base, api_key=api_key, timeout=timeout)
         self.model = model

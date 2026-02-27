@@ -446,7 +446,10 @@ def new_openai(
     auth_header: bool = True,
 ) -> OpenAI:
     base = api_base.rstrip('/')
-    if not base.endswith('/v1'):
+    # 兼容不同 OpenAI-compatible 路径：
+    # - 常见: .../v1
+    # - 智谱: .../api/paas/v4
+    if not re.search(r"/v\d+$", base):
         base += '/v1'
 
     safe_headers = headers if isinstance(headers, dict) else None
