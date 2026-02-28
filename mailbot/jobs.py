@@ -1099,12 +1099,20 @@ def summarize_job(cfg: dict):
                         if cleaned_articles:
                             # accumulate articles for this message
                             aggregated_articles.extend(cleaned_articles)
-                            # allow模型在无相关文章时给出整体原因说明
+                            # allow model to return an overall reason alongside cards
                             if reason:
                                 answers_texts.append(reason)
                         else:
-                            summary_output_valid = False
-                            invalid_reasons.append("articles-empty-fields")
+                            # Accept explicit "no relevant papers" output:
+                            # {"articles": [], "no_match_reason": "..."}
+                            if reason:
+                                logger.info(
+                                    f"总结结果无匹配论文，使用 no_match_reason 作为输出: {sub} (uid={uid})"
+                                )
+                                answers_texts.append(reason)
+                            else:
+                                summary_output_valid = False
+                                invalid_reasons.append("articles-empty-fields")
                     else:
                         # Detect clearly unusable pseudo-JSON output such as [2026]
                         st = (summary or "").strip()
