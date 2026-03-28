@@ -481,6 +481,12 @@ def start_scheduler():
         logger.info(f"NEXT 下次机器翻译时间: {run_at.strftime('%Y-%m-%d %H:%M:%S %Z')}")
 
     def _run_translate():
+        if follow_translate_interval:
+            logger.info(
+                "NEXT 当前配置为'总结跟随翻译间隔'，本轮将先执行机器总结，再执行机器翻译"
+            )
+            _run_summarize()
+
         with RUN_LOCK:
             t0 = datetime.now(tz)
             logger.info("START 开始执行机器翻译")
@@ -495,14 +501,8 @@ def start_scheduler():
         # schedule next translate from finish time
         _schedule_translate_next(translate_delay)
 
-        if follow_translate_interval:
-            logger.info(
-                "NEXT 当前配置为'总结跟随翻译间隔'，本次翻译结束后立即执行总结"
-            )
-            _run_summarize()
-
         # if summarize was delayed while translating, run catch-up immediately
-        if summarize_pending.get("flag"):
+        if (not follow_translate_interval) and summarize_pending.get("flag"):
             summarize_pending["flag"] = False
             sch.add_job(_run_summarize, DateTrigger(run_date=datetime.now(tz) + timedelta(seconds=1)), id="summarize-catchup", replace_existing=True)
             logger.info("FLAG 检测到错过的总结任务，本次翻译结束后将立即补跑一次总结")
