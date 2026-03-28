@@ -32,6 +32,9 @@
                                   ],
                       "batch_size":  10,
                       "chunk_tokens":  16000,
+                      "inbox_keywords":  [
+                                             "学者相关研究汇总"
+                                         ],
                       "unseen_fetch_chunk":  500,
                       "max_unseen_per_run_per_folder":  0,
                       "scan_order":  "newest",

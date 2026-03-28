@@ -919,6 +919,28 @@ def summarize_job(cfg: dict):
     prompt = prompt_path.read_text(encoding='utf-8') if prompt_path.exists() else '请用中文进行总结，并给出结构化要点。'
 
     folders = sum_cfg.get('folders', DEFAULT_SUMMARY_FOLDERS)
+    inbox_keywords = [
+        str(k).strip()
+        for k in (sum_cfg.get('inbox_keywords', []) or [])
+        if str(k).strip()
+    ]
+    scan_plans: list[dict] = [
+        {
+            'folder': folder,
+            'mode': 'folder',
+            'mark_seen_after_summary': True,
+        }
+        for folder in folders
+    ]
+    if inbox_keywords:
+        scan_plans.append(
+            {
+                'folder': 'INBOX',
+                'mode': 'inbox_keyword',
+                'mark_seen_after_summary': False,
+            }
+        )
+
     batch_size = int(sum_cfg.get('batch_size', 10))
     chunk_chars = int(sum_cfg.get('chunk_tokens', 16000))  # approx by chars
 
@@ -931,6 +953,7 @@ def summarize_job(cfg: dict):
     _meta = {
         'mode': 'job',
         'folders': folders,
+        'inbox_keywords': inbox_keywords,
         'batch_size': batch_size,
         'chunk_chars': chunk_chars,
         'model': model,
@@ -947,8 +970,16 @@ def summarize_job(cfg: dict):
 
     _maybe_save([])
     try:
-        for folder in folders:
-            logger.info(f"扫描总结文件夹: {folder}")
+        for plan in scan_plans:
+            folder = str(plan.get('folder') or 'INBOX')
+            scan_mode = str(plan.get('mode') or 'folder')
+            mark_seen_after_summary = bool(plan.get('mark_seen_after_summary', True))
+
+            if scan_mode == 'inbox_keyword':
+                logger.info(f"扫描总结 INBOX 关键字通道: {','.join(inbox_keywords)}")
+            else:
+                logger.info(f"扫描总结文件夹: {folder}")
+
             # robust unseen enumeration to avoid server SEARCH limits
             fetch_chunk = int(sum_cfg.get('unseen_fetch_chunk', 500))
             uids = search_unseen_without_prefix(c, folder, exclude_auto_generated=True, robust=True, fetch_chunk=fetch_chunk)
@@ -967,6 +998,10 @@ def summarize_job(cfg: dict):
                 sub = decode_subject(msg)
                 if not pass_prefix(sub, excluded):
                     continue
+                if scan_mode == 'inbox_keyword':
+                    if not any(k in sub for k in inbox_keywords):
+                        continue
+                    logger.info(f"INBOX 总结关键字命中: {sub} (uid={uid})")
                 logger.info(f"待总结邮件: {sub} (uid={uid})")
                 html, txt = pick_html_or_text(msg)
                 plain = _extract_plain_for_summary(html, txt)
@@ -974,7 +1009,10 @@ def summarize_job(cfg: dict):
                     f"总结文本提取: html_chars={len(html or '')}, txt_chars={len(txt or '')}, cleaned_chars={len(plain)}"
                 )
                 if not plain:
-                    mark_seen(c, folder, uid)
+                    if mark_seen_after_summary:
+                        mark_seen(c, folder, uid)
+                    else:
+                        logger.info(f"INBOX 关键字总结通道保留未读（空内容跳过）: {sub} (uid={uid})")
                     continue
                 total_chars = len(plain)
                 total_tokens = rough_token_count(plain)
@@ -1165,12 +1203,16 @@ def summarize_job(cfg: dict):
                 if not batch:
                     continue
                 html = _render_summary_html([(m, summ) for _, m, summ in batch], folder)
-                subject = f"{pref.get('summarize','[机器总结]')} {folder}（{len(batch)}封）"
+                folder_label = "INBOX关键词" if scan_mode == 'inbox_keyword' else folder
+                subject = f"{pref.get('summarize','[机器总结]')} {folder_label}（{len(batch)}封）"
                 out = build_email(subject, imap['email'], imap['email'], html, None)
                 append_unseen(c, folder, out)
                 logger.info(f"已写入总结邮件: {subject}")
-                for uid, _, _ in batch:
-                    mark_seen(c, folder, uid)
+                if mark_seen_after_summary:
+                    for uid, _, _ in batch:
+                        mark_seen(c, folder, uid)
+                else:
+                    logger.info(f"INBOX 关键字总结通道保留原邮件未读: {len(batch)} 封")
                 # checkpoint after each batch
                 _meta['entries_written'] = len(submitted_entries)
                 _meta['last_update'] = datetime.now().isoformat(timespec='seconds')
