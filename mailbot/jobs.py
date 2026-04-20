@@ -39,6 +39,35 @@ def _save_summary_payload(entries: list[dict], path: Path | None = None, meta: d
         logger.info(f"保存机器总结 payload 文件失败: {e}")
 
 
+def _article_card_html(a: dict) -> str:
+    tzh = (a.get('title_zh') or '').strip()
+    ten = (a.get('title_en') or '').strip()
+    authors = (a.get('authors') or '').strip()
+    journal = (a.get('journal') or '').strip()
+    bullets = [b for b in (a.get('bullets') or []) if (b or '').strip()]
+    rel = (a.get('relevance') or '').strip()
+    journal_html = (
+        f"<div style=\"font-size:12px;color:#4b5563;margin-bottom:4px;\">期刊/来源：{journal}</div>"
+        if journal else ""
+    )
+    lis = ''.join(f"<li>{b}</li>" for b in bullets[:3])
+    return f"""
+<div style=\"border:1px solid #e5e7eb;border-radius:10px;padding:10px 12px;margin:10px 0;\">
+  <div style=\"font-weight:700;font-size:15px;line-height:1.35;margin-bottom:6px;\">
+    <span style=\"color:#111827;\">中文标题：</span><span style=\"color:#111827;\">{tzh}</span>
+  </div>
+  <div style=\"font-size:12px;color:#374151;margin-bottom:4px;\">English Title: {ten}</div>
+  {journal_html}
+  <div style=\"font-size:12px;color:#6b7280;margin-bottom:6px;\">Authors: {authors}</div>
+  <div>
+    <div style=\"font-weight:600;color:#111827;margin-bottom:4px;\">要点</div>
+    <ul style=\"margin:0;padding-left:18px;\">{lis}</ul>
+    <div style=\"font-size:12px;color:#059669;margin-top:6px;\">相关性：{rel}</div>
+  </div>
+</div>
+"""
+
+
 def _render_summary_html(items: list[tuple[object, str]], folder: str) -> str:
     # items: list of (message, summary_text or rendered HTML)
     now = datetime.now().strftime('%Y-%m-%d %H:%M')
@@ -54,26 +83,7 @@ def _render_summary_html(items: list[tuple[object, str]], folder: str) -> str:
         return "<ul style=\"margin:0; padding-left:18px;\">" + "".join(lis) + "</ul>"
 
     def _card(a: dict) -> str:
-        tzh = (a.get('title_zh') or '').strip()
-        ten = (a.get('title_en') or '').strip()
-        authors = (a.get('authors') or '').strip()
-        bullets = [b for b in (a.get('bullets') or []) if (b or '').strip()]
-        rel = (a.get('relevance') or '').strip()
-        lis = ''.join(f"<li>{b}</li>" for b in bullets[:3])
-        return f"""
-<div style=\"border:1px solid #e5e7eb;border-radius:10px;padding:10px 12px;margin:10px 0;\">
-  <div style=\"font-weight:700;font-size:15px;line-height:1.35;margin-bottom:6px;\">
-    <span style=\"color:#111827;\">中文标题：</span><span style=\"color:#111827;\">{tzh}</span>
-  </div>
-  <div style=\"font-size:12px;color:#374151;margin-bottom:4px;\">English Title: {ten}</div>
-  <div style=\"font-size:12px;color:#6b7280;margin-bottom:6px;\">Authors: {authors}</div>
-  <div>
-    <div style=\"font-weight:600;color:#111827;margin-bottom:4px;\">要点</div>
-    <ul style=\"margin:0;padding-left:18px;\">{lis}</ul>
-    <div style=\"font-size:12px;color:#059669;margin-top:6px;\">相关性：{rel}</div>
-  </div>
-</div>
-"""
+        return _article_card_html(a)
 
     def _cards(articles: list[dict]) -> str:
         if not articles:
@@ -287,6 +297,7 @@ def _parse_articles_from_text_summary(text: str | None) -> list[dict]:
       中文标题：...
       English Title: ...
       Authors: ...
+      期刊/来源：...
       要点：
       - ...
       相关性：...
@@ -305,6 +316,7 @@ def _parse_articles_from_text_summary(text: str | None) -> list[dict]:
             "title_zh": "",
             "title_en": "",
             "authors": "",
+            "journal": "",
             "bullets": [],
             "relevance": "",
         }
@@ -332,6 +344,7 @@ def _parse_articles_from_text_summary(text: str | None) -> list[dict]:
             str(cur.get("title_zh") or "").strip()
             or str(cur.get("title_en") or "").strip()
             or str(cur.get("authors") or "").strip()
+            or str(cur.get("journal") or "").strip()
             or cur.get("bullets")
         )
         if ok:
@@ -375,6 +388,17 @@ def _parse_articles_from_text_summary(text: str | None) -> list[dict]:
             parts = re.split(r"[：:]", line, maxsplit=1)
             if len(parts) == 2:
                 cur["authors"] = parts[1].strip()
+            in_bullets = False
+            continue
+
+        if (
+            line.startswith("期刊")
+            or low.startswith("journal")
+            or low.startswith("source")
+        ):
+            parts = re.split(r"[：:]", line, maxsplit=1)
+            if len(parts) == 2:
+                cur["journal"] = parts[1].strip()
             in_bullets = False
             continue
 
@@ -1178,20 +1202,14 @@ def summarize_job(cfg: dict):
                         if key and key not in seen:
                             seen.add(key); uniq.append(a)
                     # cap to 12 for readability
-                    cards_html = ''.join([
-                        f"<div style=\"border:1px solid #e5e7eb;border-radius:10px;padding:10px 12px;margin:10px 0;\"><div style=\"font-weight:700;font-size:15px;line-height:1.35;margin-bottom:6px;\"><span style=\"color:#111827;\">中文标题：</span><span style=\"color:#111827;\">{(a.get('title_zh') or '').strip()}</span></div><div style=\"font-size:12px;color:#374151;margin-bottom:4px;\">English Title: {(a.get('title_en') or '').strip()}</div><div style=\"font-size:12px;color:#6b7280;margin-bottom:6px;\">Authors: {(a.get('authors') or '').strip()}</div><div><div style=\"font-weight:600;color:#111827;margin-bottom:4px;\">要点</div><ul style=\"margin:0;padding-left:18px;\">{''.join(f'<li>{b}</li>' for b in (a.get('bullets') or []) if (b or '').strip())}</ul><div style=\"font-size:12px;color:#059669;margin-top:6px;\">相关性：{(a.get('relevance') or '').strip()}</div></div></div>"
-                        for a in uniq[:12]
-                    ])
+                    cards_html = ''.join([_article_card_html(a) for a in uniq[:12]])
                     pairs.append((uid, msg, cards_html))
                 else:
                     _txt = ('\n\n'.join(answers_texts)).strip()
                     parsed_text_articles = _parse_articles_from_text_summary(_txt)
                     if parsed_text_articles:
                         logger.info(f"文本总结解析为结构化卡片成功: {sub} (uid={uid}), cards={len(parsed_text_articles)}")
-                        cards_html = ''.join([
-                            f"<div style=\"border:1px solid #e5e7eb;border-radius:10px;padding:10px 12px;margin:10px 0;\"><div style=\"font-weight:700;font-size:15px;line-height:1.35;margin-bottom:6px;\"><span style=\"color:#111827;\">中文标题：</span><span style=\"color:#111827;\">{(a.get('title_zh') or '').strip()}</span></div><div style=\"font-size:12px;color:#374151;margin-bottom:4px;\">English Title: {(a.get('title_en') or '').strip()}</div><div style=\"font-size:12px;color:#6b7280;margin-bottom:6px;\">Authors: {(a.get('authors') or '').strip()}</div><div><div style=\"font-weight:600;color:#111827;margin-bottom:4px;\">要点</div><ul style=\"margin:0;padding-left:18px;\">{''.join(f'<li>{b}</li>' for b in (a.get('bullets') or []) if (b or '').strip())}</ul><div style=\"font-size:12px;color:#059669;margin-top:6px;\">相关性：{(a.get('relevance') or '').strip()}</div></div></div>"
-                            for a in parsed_text_articles[:12]
-                        ])
+                        cards_html = ''.join([_article_card_html(a) for a in parsed_text_articles[:12]])
                         pairs.append((uid, msg, cards_html))
                     else:
                         if not _txt:

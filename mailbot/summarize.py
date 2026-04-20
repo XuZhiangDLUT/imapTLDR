@@ -17,6 +17,7 @@ from .jobs import (
     deepseek_summarize,
     _get_llm_task_config,
     _build_openai_for_task,
+    _article_card_html,
 )
 from .utils import rough_token_count
 
@@ -241,14 +242,7 @@ def summarize_once(cfg: dict, folder: str | None = None, batch: int = 5):
                 for a in parsed["articles"][:12]:
                     if not isinstance(a, dict):
                         continue
-                    tzh = (a.get('title_zh') or '').strip()
-                    ten = (a.get('title_en') or '').strip()
-                    authors = (a.get('authors') or '').strip()
-                    bullets = [b for b in (a.get('bullets') or []) if (b or '').strip()]
-                    rel = (a.get('relevance') or '').strip()
-                    lis = ''.join(f"<li>{b}</li>" for b in bullets[:3])
-                    card = f"<div style=\"border:1px solid #e5e7eb;border-radius:10px;padding:10px 12px;margin:10px 0;\"><div style=\"font-weight:700;font-size:15px;line-height:1.35;margin-bottom:6px;\"><span style=\"color:#111827;\">中文标题：</span><span style=\"color:#111827;\">{tzh}</span></div><div style=\"font-size:12px;color:#374151;margin-bottom:4px;\">English Title: {ten}</div><div style=\"font-size:12px;color:#6b7280;margin-bottom:6px;\">Authors: {authors}</div><div><div style=\"font-weight:600;color:#111827;margin-bottom:4px;\">要点</div><ul style=\"margin:0;padding-left:18px;\">{lis}</ul><div style=\"font-size:12px;color:#059669;margin-top:6px;\">相关性：{rel}</div></div></div>"
-                cards.append(card)
+                    cards.append(_article_card_html(a))
                 rendered = ''.join(cards)
                 if not rendered:
                     # 当没有任何相关文章时，优先展示模型给出的原因说明
