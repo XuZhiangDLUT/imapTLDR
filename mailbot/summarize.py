@@ -124,6 +124,7 @@ def summarize_once(cfg: dict, folder: str | None = None, batch: int = 5):
             "provider": provider_kind,
             "model": model,
             "enable_thinking": bool(enable_thinking),
+            "stream": bool(task.get("stream", False)),
             "mock": bool(use_mock),
             "start_time": run_start.isoformat(timespec='seconds'),
             "run_id": run_ts,
@@ -177,6 +178,7 @@ def summarize_once(cfg: dict, folder: str | None = None, batch: int = 5):
                     timeout=timeout,
                     expect_json=bool(task.get("expect_json", True)),
                     provider=provider_kind,
+                    stream=bool(task.get("stream", False)),
                 )
 
                 # 主模型失败时，尝试 summarize_fallback
@@ -192,6 +194,7 @@ def summarize_once(cfg: dict, folder: str | None = None, batch: int = 5):
                         timeout=fallback_timeout,
                         expect_json=bool(fallback_task.get("expect_json", task.get("expect_json", True))),
                         provider=str(fallback_task.get("provider") or provider_kind),
+                        stream=bool(fallback_task.get("stream", False)),
                     )
                     if fsumm != "(summary timeout or error)":
                         summ, thinking, meta_extra = fsumm, fthinking, (fmeta or {})

@@ -547,6 +547,7 @@ def _get_llm_task_config(
     thinking_budget = int(tcfg.get("thinking_budget", default_thinking_budget))
     expect_json = bool(tcfg.get("expect_json", default_expect_json))
     prompt_file = tcfg.get("prompt_file", default_prompt_file)
+    stream = bool(tcfg.get("stream", False))
 
     use_mock = bool(llm_cfg.get("mock", False) or cfg.get("test", {}).get("mock_llm", False))
 
@@ -562,6 +563,7 @@ def _get_llm_task_config(
         "enable_thinking": enable_thinking,
         "thinking_budget": thinking_budget,
         "expect_json": expect_json,
+        "stream": stream,
         "prompt_file": prompt_file,
         "mock": use_mock,
         "raw": tcfg,
@@ -629,6 +631,85 @@ def _build_reasoning_extra(
         extra["generationConfig"] = gen_cfg
 
     return extra
+
+
+def _extract_text_like(value) -> str:
+    """Normalize OpenAI-compatible text fields that may be str/list/object."""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        parts: list[str] = []
+        for part in value:
+            if isinstance(part, str):
+                parts.append(part)
+            elif isinstance(part, dict):
+                txt = part.get("text")
+                if isinstance(txt, str):
+                    parts.append(txt)
+            else:
+                txt = getattr(part, "text", None)
+                if isinstance(txt, str):
+                    parts.append(txt)
+        return "".join(parts)
+    if isinstance(value, dict):
+        txt = value.get("text")
+        return txt if isinstance(txt, str) else ""
+    txt = getattr(value, "text", None)
+    return txt if isinstance(txt, str) else ""
+
+
+def _extract_reasoning_chunk(delta: dict) -> str:
+    for key in (
+        "reasoning_content",
+        "reasoningContent",
+        "reasoning",
+        "thought",
+        "thoughts",
+        "thinking",
+        "analysis",
+    ):
+        chunk = _extract_text_like(delta.get(key))
+        if chunk:
+            return chunk
+    return ""
+
+
+def _dump_obj(obj) -> dict:
+    if obj is None:
+        return {}
+    if isinstance(obj, dict):
+        return obj
+    if hasattr(obj, "model_dump"):
+        try:
+            return obj.model_dump(exclude_none=True)
+        except Exception:
+            return {}
+    data = getattr(obj, "__dict__", {}) or {}
+    return data if isinstance(data, dict) else {}
+
+
+def _capture_usage_meta(meta: dict, usage) -> None:
+    if usage is None:
+        return
+    u = _dump_obj(usage)
+    if not isinstance(u, dict) or not u:
+        return
+    meta["usage"] = u
+    for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
+        val = u.get(key)
+        if val is not None:
+            try:
+                meta[key] = int(val)
+            except Exception:
+                meta[key] = val
+    ctd = u.get("completion_tokens_details") or {}
+    if isinstance(ctd, dict):
+        rt = ctd.get("reasoning_tokens")
+        if rt is not None:
+            try:
+                meta["reasoning_tokens"] = int(rt)
+            except Exception:
+                meta["reasoning_tokens"] = rt
 
 
 def preflight_check_llm(cfg: dict) -> bool:
@@ -781,6 +862,7 @@ def deepseek_summarize(
     timeout: float | int = 15.0,
     expect_json: bool = False,
     provider: str = "",
+    stream: bool = False,
 ) -> tuple[str, str, dict]:
     """Generic summarize helper for OpenAI-compatible backends (DeepSeek / Gemini).
 
@@ -804,56 +886,74 @@ def deepseek_summarize(
         except Exception:
             pass
     try:
-        r = cli.chat.completions.create(
-            model=model,
-            temperature=0.2,
-            messages=[{"role": "system", "content": prompt}, {"role": "user", "content": text}],
-            extra_body=extra or None,
-            timeout=timeout,
-        )
+        req = {
+            "model": model,
+            "temperature": 0.2,
+            "messages": [{"role": "system", "content": prompt}, {"role": "user", "content": text}],
+            "extra_body": extra or None,
+            "timeout": timeout,
+        }
+        if stream:
+            logger.info(f"LLM 总结启用流式调用: model={model}, provider={provider or '(unknown)'}")
+            content_parts: list[str] = []
+            thinking_parts: list[str] = []
+            chunk_count = 0
+            first_content_logged = False
+            first_reasoning_logged = False
+            for chunk in cli.chat.completions.create(**req, stream=True):
+                chunk_count += 1
+                try:
+                    cid = getattr(chunk, "id", None)
+                    if cid:
+                        meta["completion_id"] = cid
+                except Exception:
+                    pass
+                try:
+                    _capture_usage_meta(meta, getattr(chunk, "usage", None))
+                except Exception:
+                    pass
+                choices = getattr(chunk, "choices", None) or []
+                for choice in choices:
+                    delta = _dump_obj(getattr(choice, "delta", None) or getattr(choice, "message", None))
+                    if not delta:
+                        continue
+                    reasoning_chunk = _extract_reasoning_chunk(delta)
+                    content_chunk = _extract_text_like(delta.get("content") or delta.get("text"))
+                    if reasoning_chunk:
+                        thinking_parts.append(reasoning_chunk)
+                        if not first_reasoning_logged:
+                            logger.info("LLM 流式总结已收到首个 reasoning/thinking chunk")
+                            first_reasoning_logged = True
+                    if content_chunk:
+                        content_parts.append(content_chunk)
+                        if not first_content_logged:
+                            logger.info("LLM 流式总结已收到首个 content chunk")
+                            first_content_logged = True
+            content = "".join(content_parts)
+            thinking = "".join(thinking_parts)
+            meta["stream"] = True
+            meta["stream_chunks"] = chunk_count
+            logger.info(
+                f"LLM 流式总结完成: chunks={chunk_count}, "
+                f"content_chars={len(content)}, thinking_chars={len(thinking)}"
+            )
+            return content, thinking, meta
+
+        r = cli.chat.completions.create(**req)
         msg = r.choices[0].message
         content = (getattr(msg, "content", None) or "")
 
         # best-effort extract provider-specific thinking / reasoning output
         thinking = ""
         try:
-            if hasattr(msg, "reasoning_content"):
-                thinking = getattr(msg, "reasoning_content") or ""
-            else:
-                d = msg.model_dump(exclude_none=True) if hasattr(msg, "model_dump") else getattr(
-                    msg, "__dict__", {}
-                ) or {}
-                if isinstance(d, dict):
-                    thinking = d.get("reasoning_content") or d.get("thinking") or ""
+            d = _dump_obj(msg)
+            thinking = _extract_reasoning_chunk(d)
         except Exception:
             thinking = ""
 
         # capture provider usage / reasoning token stats when available
         try:
-            usage = getattr(r, "usage", None)
-            if usage is not None:
-                if hasattr(usage, "model_dump"):
-                    u = usage.model_dump(exclude_none=True)
-                else:
-                    u = getattr(usage, "__dict__", {}) or {}
-                if isinstance(u, dict):
-                    meta["usage"] = u
-                    # Flatten common token counters for easier inspection
-                    for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
-                        val = u.get(key)
-                        if val is not None:
-                            try:
-                                meta[key] = int(val)
-                            except Exception:
-                                meta[key] = val
-                    ctd = u.get("completion_tokens_details") or {}
-                    if isinstance(ctd, dict):
-                        rt = ctd.get("reasoning_tokens")
-                        if rt is not None:
-                            try:
-                                meta["reasoning_tokens"] = int(rt)
-                            except Exception:
-                                meta["reasoning_tokens"] = rt
+            _capture_usage_meta(meta, getattr(r, "usage", None))
         except Exception:
             # usage metadata is optional; swallow all errors here
             pass
@@ -983,6 +1083,7 @@ def summarize_job(cfg: dict):
         'model': model,
         'provider': provider_kind,
         'enable_thinking': bool(enable_thinking),
+        'stream': bool(task.get("stream", False)),
         'mock': bool(use_mock),
         'start_time': _run_start.isoformat(timespec='seconds'),
         'run_id': _run_ts,
@@ -1071,6 +1172,7 @@ def summarize_job(cfg: dict):
                             timeout=summarize_timeout,
                             expect_json=bool(task.get("expect_json", True)),
                             provider=provider_kind,
+                            stream=bool(task.get("stream", False)),
                         )
                         # 检测主模型是否超时或出错，若有 fallback 模型则使用兜底
                         if "(summary timeout or error)" in summary and fallback_model and fallback_cli:
@@ -1087,6 +1189,7 @@ def summarize_job(cfg: dict):
                                 timeout=fallback_timeout,
                                 expect_json=bool(fallback_task.get("expect_json", True)),
                                 provider=str(fallback_task.get("provider") or provider_kind),
+                                stream=bool(fallback_task.get("stream", False)),
                             )
                             used_fallback = True
                             if "(summary timeout or error)" not in summary:
