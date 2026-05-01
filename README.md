@@ -25,6 +25,7 @@ mailbot/
   ├─ llm.py / mock_llm.py# LLM 客户端与本地 mock
   └─ utils.py            # prefix 过滤、分片、token 估算等
 scripts/                # 调试脚本（test_gemini_x666、count_folder_messages…）
+apps-script/            # Google Apps Script 邮件转发器（Gmail / Scholar 快讯）
 data/                   # 摘要 JSON 日志，便于回溯
 Prompt.txt               # 摘要提示模版，可自定义
 config(.example).json    # 主配置，需填写 QQ IMAP 授权码等
@@ -124,6 +125,38 @@ run.py                   # CLI 入口，支持 summarize / summarize_job
 | 调度常驻 | `python -m mailbot.scheduler` | 同时管理 summarize + translate。Ctrl+C 即刻退出，无需等待任务。 |
 | 只跑 summarize 流水线（cron 逻辑） | `python run.py summarize_job` | 适合配合系统级调度器（Task Scheduler / systemd timer）。 |
 | 临时抽样摘要 | `python run.py summarize <folder> <batch>` | 不写入 APScheduler，便于检查配置效果。 |
+
+## Google Apps Script 转发器
+
+仓库同时保存了一份运行在 Google Apps Script 的 Gmail 自动化脚本：`apps-script/google-scholar-forwarder/Code.gs`。它用于配合本地 MailBot 做邮件入口整理：Google Scholar 关键词/学者快讯先打标签，再按早、中、晚汇总转发；其他收件箱邮件会直接转发，并打上已转发标签，避免重复处理。
+
+### 部署步骤
+
+1. 打开 [Google Apps Script](https://script.google.com/)，新建项目，例如命名为“转发邮件”。
+2. 将 `apps-script/google-scholar-forwarder/Code.gs` 的内容复制到 Apps Script 的 `Code.gs`。
+3. 如需手动维护 manifest，在项目设置中开启“在编辑器中显示 appsscript.json”，并参考 `apps-script/google-scholar-forwarder/appsscript.json` 设置时区和 V8 运行时。
+4. 在 Apps Script 左侧进入“项目设置”，添加 Script Properties：
+   - 属性名：`FORWARDING_ADDRESS`
+   - 属性值：你的目标收件邮箱
+5. 先在编辑器中手动运行一次 `processIncomingEmails`，按提示授权 Gmail 权限。授权后检查执行日志，确认标签可创建、目标邮箱有效。
+6. 进入左侧“触发器”，按截图中的模式创建基于时间的触发器：
+
+| 函数 | 触发器建议 | 用途 |
+| --- | --- | --- |
+| `processIncomingEmails` | 每 5 分钟 | 扫描收件箱，Scholar 快讯打标签，其他邮件直接转发 |
+| `summarizeKeywordAlerts_Morning` | 每天 07:00 左右 | 汇总关键词快讯 |
+| `summarizeKeywordAlerts_Noon` | 每天 12:00 左右 | 汇总关键词快讯 |
+| `summarizeKeywordAlerts_Evening` | 每天 19:00 左右 | 汇总关键词快讯 |
+| `summarizeAuthorAlerts_Morning` | 每天 07:00 左右 | 汇总学者相关研究快讯 |
+| `summarizeAuthorAlerts_Noon` | 每天 12:00 左右 | 汇总学者相关研究快讯 |
+| `summarizeAuthorAlerts_Evening` | 每天 19:00 左右 | 汇总学者相关研究快讯 |
+
+### 注意事项
+
+- 不要把真实转发邮箱写回 `Code.gs`；脚本从 `FORWARDING_ADDRESS` 这个 Script Property 读取，仓库中的版本已脱敏。
+- Google Apps Script 的时间触发器不是精确到秒执行，通常会在所选时间窗口内运行。
+- 如果汇总邮件过大，调小 `SUMMARY_BATCH_SIZE`；如果触发 Gmail 配额限制，降低触发频率或减少每轮处理上限。
+- 脚本会创建并使用 `scholar-keywords-processed`、`scholar-author-processed`、`forwarded-by-script` 三个 Gmail 标签。
 
 ## 日志与观测
 
