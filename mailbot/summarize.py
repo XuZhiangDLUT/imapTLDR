@@ -73,6 +73,7 @@ def summarize_once(cfg: dict, folder: str | None = None, batch: int = 5):
         model = task["model"]
         enable_thinking = bool(task["enable_thinking"])
         thinking_budget = int(task["thinking_budget"])
+        reasoning_effort = task.get("reasoning_effort")
         use_mock = bool(task["mock"])
         prompt_path = Path(task.get("prompt_file") or "Prompt.txt")
         prompt = prompt_path.read_text(encoding="utf-8") if prompt_path.exists() else "Summarize in Chinese."
@@ -94,6 +95,7 @@ def summarize_once(cfg: dict, folder: str | None = None, batch: int = 5):
         fallback_model = fallback_task["model"]
         fallback_enable_thinking = bool(fallback_task["enable_thinking"])
         fallback_thinking_budget = int(fallback_task["thinking_budget"])
+        fallback_reasoning_effort = fallback_task.get("reasoning_effort")
         fallback_timeout = float(fallback_task["timeout_seconds"] or timeout)
         fallback_cli = None
         if fallback_model and not use_mock:
@@ -107,6 +109,7 @@ def summarize_once(cfg: dict, folder: str | None = None, batch: int = 5):
             logger.info(
                 f"Summarize-once LLM configured: provider={provider_kind}, model={model}, "
                 f"enable_thinking={enable_thinking}, thinking_budget={thinking_budget}, "
+                f"reasoning_effort={reasoning_effort or '(none)'}, "
                 f"fallback_model={fallback_model or '(none)'}"
             )
         else:
@@ -124,6 +127,8 @@ def summarize_once(cfg: dict, folder: str | None = None, batch: int = 5):
             "provider": provider_kind,
             "model": model,
             "enable_thinking": bool(enable_thinking),
+            "thinking_budget": int(thinking_budget),
+            "reasoning_effort": reasoning_effort,
             "stream": bool(task.get("stream", False)),
             "mock": bool(use_mock),
             "start_time": run_start.isoformat(timespec='seconds'),
@@ -163,6 +168,7 @@ def summarize_once(cfg: dict, folder: str | None = None, batch: int = 5):
             used_model = model
             used_enable_thinking = enable_thinking
             used_thinking_budget = thinking_budget
+            used_reasoning_effort = reasoning_effort
 
             if use_mock:
                 # mock 模式仅使用本地模拟摘要
@@ -179,6 +185,7 @@ def summarize_once(cfg: dict, folder: str | None = None, batch: int = 5):
                     expect_json=bool(task.get("expect_json", True)),
                     provider=provider_kind,
                     stream=bool(task.get("stream", False)),
+                    reasoning_effort=reasoning_effort,
                 )
 
                 # 主模型失败时，尝试 summarize_fallback
@@ -195,6 +202,7 @@ def summarize_once(cfg: dict, folder: str | None = None, batch: int = 5):
                         expect_json=bool(fallback_task.get("expect_json", task.get("expect_json", True))),
                         provider=str(fallback_task.get("provider") or provider_kind),
                         stream=bool(fallback_task.get("stream", False)),
+                        reasoning_effort=fallback_reasoning_effort,
                     )
                     if fsumm != "(summary timeout or error)":
                         summ, thinking, meta_extra = fsumm, fthinking, (fmeta or {})
@@ -202,6 +210,7 @@ def summarize_once(cfg: dict, folder: str | None = None, batch: int = 5):
                         used_model = fallback_model
                         used_enable_thinking = fallback_enable_thinking
                         used_thinking_budget = fallback_thinking_budget
+                        used_reasoning_effort = fallback_reasoning_effort
                         logger.info("Summarize-once 兜底模型总结成功")
 
             try:
@@ -225,6 +234,7 @@ def summarize_once(cfg: dict, folder: str | None = None, batch: int = 5):
                 "model": used_model,
                 "enable_thinking": bool(used_enable_thinking),
                 "thinking_budget": int(used_thinking_budget),
+                "reasoning_effort": used_reasoning_effort,
                 "used_fallback": bool(used_fallback),
                 "thinking": thinking,
                 "answer": summ,

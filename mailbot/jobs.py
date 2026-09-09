@@ -545,6 +545,9 @@ def _get_llm_task_config(
 
     enable_thinking = bool(tcfg.get("enable_thinking", default_enable_thinking))
     thinking_budget = int(tcfg.get("thinking_budget", default_thinking_budget))
+    reasoning_effort = tcfg.get("reasoning_effort", provider_cfg.get("reasoning_effort"))
+    if reasoning_effort is not None:
+        reasoning_effort = str(reasoning_effort).strip().lower() or None
     expect_json = bool(tcfg.get("expect_json", default_expect_json))
     prompt_file = tcfg.get("prompt_file", default_prompt_file)
     stream = bool(tcfg.get("stream", False))
@@ -562,6 +565,7 @@ def _get_llm_task_config(
         "auth_header": auth_header,
         "enable_thinking": enable_thinking,
         "thinking_budget": thinking_budget,
+        "reasoning_effort": reasoning_effort,
         "expect_json": expect_json,
         "stream": stream,
         "prompt_file": prompt_file,
@@ -596,10 +600,12 @@ def _build_reasoning_extra(
     model: str,
     enable_thinking: bool,
     thinking_budget: int,
+    reasoning_effort: str | None = None,
 ) -> dict:
     """
     Build provider-specific reasoning/thinking request fields.
 
+    - OpenAI-compatible reasoning models: reasoning_effort (no fixed budget)
     - DeepSeek/SiliconFlow style: enable_thinking + thinking_budget
     - Zhipu GLM style: thinking.type = enabled/disabled
     - Gemini bridge: generationConfig.thinkingConfig.thinkingBudget
@@ -607,6 +613,12 @@ def _build_reasoning_extra(
     provider_norm = str(provider or "").lower()
     model_name = str(model or "")
     extra: dict = {}
+    effort = str(reasoning_effort or "").strip().lower()
+
+    # A configured effort deliberately takes precedence over the legacy budget
+    # fields, which lets the upstream select an automatic reasoning length.
+    if effort:
+        return {"reasoning_effort": effort}
 
     if provider_norm == "zhipu":
         extra["thinking"] = {"type": "enabled" if enable_thinking else "disabled"}
@@ -760,6 +772,7 @@ def preflight_check_llm(cfg: dict) -> bool:
         provider = task.get("provider") or "unknown"
         enable_thinking = bool(task.get("enable_thinking", False))
         thinking_budget = int(task.get("thinking_budget", 0))
+        reasoning_effort = task.get("reasoning_effort")
         headers = task.get("headers") if isinstance(task.get("headers"), dict) else None
         auth_header = bool(task.get("auth_header", True))
 
@@ -809,6 +822,7 @@ def preflight_check_llm(cfg: dict) -> bool:
             api_key,
             enable_thinking,
             thinking_budget,
+            reasoning_effort,
             auth_header,
             tuple(sorted((headers or {}).items())),
         )
@@ -818,6 +832,8 @@ def preflight_check_llm(cfg: dict) -> bool:
         checked_combos.add(combo_key)
 
         thinking_desc = f"thinking={enable_thinking}" + (f", budget={thinking_budget}" if enable_thinking else "")
+        if reasoning_effort:
+            thinking_desc += f", reasoning_effort={reasoning_effort}"
         header_desc = f", auth_header={auth_header}, headers={bool(headers)}"
         logger.info(
             f"LLM 预检: 检查任务 '{task_name}' (provider={provider}, model={model}, {thinking_desc}{header_desc})..."
@@ -827,7 +843,13 @@ def preflight_check_llm(cfg: dict) -> bool:
             cli = new_openai(api_base, api_key, timeout=30.0, headers=headers, auth_header=auth_header)
 
             # 构建与任务相同的 extra_body 参数（provider-aware）
-            extra = _build_reasoning_extra(provider, model, enable_thinking, thinking_budget)
+            extra = _build_reasoning_extra(
+                provider,
+                model,
+                enable_thinking,
+                thinking_budget,
+                reasoning_effort,
+            )
 
             # 发送测试请求，使用与任务相同的参数（不限制 max_tokens，与正常任务一致）
             r = cli.chat.completions.create(
@@ -863,17 +885,25 @@ def deepseek_summarize(
     expect_json: bool = False,
     provider: str = "",
     stream: bool = False,
+    reasoning_effort: str | None = None,
 ) -> tuple[str, str, dict]:
     """Generic summarize helper for OpenAI-compatible backends (DeepSeek / Gemini).
 
     Returns (content, thinking, meta) where meta best-effort captures provider
     specific fields (e.g. usage, reasoning token counts) for JSON logging.
 
+    - For configured OpenAI-compatible reasoning models, sends `reasoning_effort`.
     - For DeepSeek-like models, passes `enable_thinking` / `thinking_budget` directly.
     - For Zhipu GLM, maps to `thinking: {"type": "enabled|disabled"}`.
     - For Gemini 2.5 models on x666, maps `thinking_budget` to `generationConfig.thinkingConfig.thinkingBudget`.
     """
-    extra = _build_reasoning_extra(provider, model, enable_thinking, thinking_budget)
+    extra = _build_reasoning_extra(
+        provider,
+        model,
+        enable_thinking,
+        thinking_budget,
+        reasoning_effort,
+    )
     meta: dict = {}
     if expect_json:
         try:
@@ -997,6 +1027,7 @@ def summarize_job(cfg: dict):
     use_mock = bool(task["mock"])
     enable_thinking = bool(task["enable_thinking"])
     thinking_budget = int(task["thinking_budget"])
+    reasoning_effort = task.get("reasoning_effort")
     summarize_timeout = float(task["timeout_seconds"] or 15.0)
 
     # 兜底总结任务配置：当主模型超时或出错时使用
@@ -1016,6 +1047,7 @@ def summarize_job(cfg: dict):
     fallback_cli: OpenAI | None = None
     fallback_enable_thinking = bool(fallback_task["enable_thinking"])
     fallback_thinking_budget = int(fallback_task["thinking_budget"])
+    fallback_reasoning_effort = fallback_task.get("reasoning_effort")
     fallback_timeout = float(fallback_task["timeout_seconds"] or summarize_timeout)
     if fallback_model and not use_mock:
         try:
@@ -1036,6 +1068,7 @@ def summarize_job(cfg: dict):
         logger.info(
             f"机器总结 LLM 配置: 提供商={provider_kind}, 模型={model}, "
             f"思考模式={thinking_mode}, 思考 token 上限={thinking_budget_desc}, "
+            f"reasoning_effort={reasoning_effort or '(none)'}, "
             f"兜底模型={fallback_model or '(none)'}"
         )
 
@@ -1083,6 +1116,8 @@ def summarize_job(cfg: dict):
         'model': model,
         'provider': provider_kind,
         'enable_thinking': bool(enable_thinking),
+        'thinking_budget': int(thinking_budget),
+        'reasoning_effort': reasoning_effort,
         'stream': bool(task.get("stream", False)),
         'mock': bool(use_mock),
         'start_time': _run_start.isoformat(timespec='seconds'),
@@ -1173,6 +1208,7 @@ def summarize_job(cfg: dict):
                             expect_json=bool(task.get("expect_json", True)),
                             provider=provider_kind,
                             stream=bool(task.get("stream", False)),
+                            reasoning_effort=reasoning_effort,
                         )
                         # 检测主模型是否超时或出错，若有 fallback 模型则使用兜底
                         if "(summary timeout or error)" in summary and fallback_model and fallback_cli:
@@ -1190,6 +1226,7 @@ def summarize_job(cfg: dict):
                                 expect_json=bool(fallback_task.get("expect_json", True)),
                                 provider=str(fallback_task.get("provider") or provider_kind),
                                 stream=bool(fallback_task.get("stream", False)),
+                                reasoning_effort=fallback_reasoning_effort,
                             )
                             used_fallback = True
                             if "(summary timeout or error)" not in summary:
@@ -1215,6 +1252,7 @@ def summarize_job(cfg: dict):
                         'used_fallback': used_fallback,
                         'enable_thinking': bool(fallback_enable_thinking if used_fallback else enable_thinking),
                         'thinking_budget': int(fallback_thinking_budget if used_fallback else thinking_budget),
+                        'reasoning_effort': fallback_reasoning_effort if used_fallback else reasoning_effort,
                         'thinking': thinking,
                         'answer': summary,
                         'when': datetime.now().isoformat(timespec='seconds'),
