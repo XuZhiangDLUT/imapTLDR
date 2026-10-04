@@ -1197,19 +1197,28 @@ def summarize_job(cfg: dict):
                         summary, thinking, meta_extra = summarize_mock(ch), '', {}
                         parsed = None
                     else:
-                        summary, thinking, meta_extra = deepseek_summarize(
-                            cli,
-                            model,
-                            prompt,
-                            ch,
-                            enable_thinking,
-                            thinking_budget,
-                            timeout=summarize_timeout,
-                            expect_json=bool(task.get("expect_json", True)),
-                            provider=provider_kind,
-                            stream=bool(task.get("stream", False)),
-                            reasoning_effort=reasoning_effort,
-                        )
+                        # 主模型共有 main_attempts 次调用机会，失败后先重试再考虑兜底
+                        main_attempts = max(1, int(sum_cfg.get('main_attempts', 2)))
+                        for main_attempt in range(1, main_attempts + 1):
+                            summary, thinking, meta_extra = deepseek_summarize(
+                                cli,
+                                model,
+                                prompt,
+                                ch,
+                                enable_thinking,
+                                thinking_budget,
+                                timeout=summarize_timeout,
+                                expect_json=bool(task.get("expect_json", True)),
+                                provider=provider_kind,
+                                stream=bool(task.get("stream", False)),
+                                reasoning_effort=reasoning_effort,
+                            )
+                            if "(summary timeout or error)" not in summary:
+                                break
+                            if main_attempt < main_attempts:
+                                logger.warning(
+                                    f"主模型总结失败，重试 {main_attempt + 1}/{main_attempts}"
+                                )
                         # 检测主模型是否超时或出错，若有 fallback 模型则使用兜底
                         if "(summary timeout or error)" in summary and fallback_model and fallback_cli:
                             logger.warning(
@@ -1668,6 +1677,7 @@ def translate_job(cfg: dict):
     # 当 force_retranslate 为 true 时，会跳过 has_linked_reply 幂等检查，用于重新翻译已有邮件
     force_retranslate = bool(tcfg.get('force_retranslate', False))
     max_translate_attempts = max(1, int(tcfg.get('max_retry', 3)))
+    fallback_translate_attempts = max(1, int(tcfg.get('fallback_max_retry', 3)))
     rpm_limit = int(tcfg.get('rpm_limit', 1000))
     tpm_limit = int(tcfg.get('tpm_limit', 50000))
     max_workers = int(tcfg.get('concurrency', 6))
@@ -1824,36 +1834,43 @@ def translate_job(cfg: dict):
                     f"翻译重试 {attempt}/{max_translate_attempts}，剩余 {len(pending)} 个片段待处理"
                 )
 
-        # 对仍然不合格的段落，使用“兜底翻译任务”配置进行最后一次翻译尝试（不启用思考）
+        # 对仍然不合格的段落，使用“兜底翻译任务”配置进行多轮翻译尝试（不启用思考）
         if pending and fallback_model:
             logger.warning(
-                f"翻译兜底: 使用兜底模型={fallback_model} 处理 {len(pending)} 个片段"
+                f"翻译兜底: 使用兜底模型={fallback_model} 处理 {len(pending)} 个片段（最多 {fallback_translate_attempts} 轮）"
             )
-            for idx in list(pending):
-                src = batch[idx]
-                if not src:
-                    continue
-                # 兜底同样走简单的限流控制，避免压垮后端
-                try:
-                    est_tokens = max(1, int(rough_token_count(src) + 64))
-                except Exception:
-                    est_tokens = 128
-                try:
-                    req_bucket.acquire(1.0)
-                    tok_bucket.acquire(float(est_tokens))
-                except Exception:
-                    pass
-                try:
-                    # 直接复用 qwen_translate_single 的翻译 prompt，只是换成兜底模型；
-                    # 不传任何 enable_thinking / thinking_budget 之类的额外参数。
-                    backend = fallback_cli or cli
-                    tr = qwen_translate_single(backend, fallback_model, src, timeout=translate_timeout) if backend else ""
-                except Exception as exc:
-                    logger.info(f"兜底翻译出错: {exc}")
-                    tr = ''
-                outs[idx] = (tr or '').strip()
-            # 兜底后再检查一遍哪些段落仍然看起来“没有翻译成功”
-            pending = [idx for idx in pending if not _looks_translated(batch[idx], outs[idx])]
+            fb_round = 0
+            while pending and fb_round < fallback_translate_attempts:
+                fb_round += 1
+                for idx in list(pending):
+                    src = batch[idx]
+                    if not src:
+                        continue
+                    # 兜底同样走简单的限流控制，避免压垮后端
+                    try:
+                        est_tokens = max(1, int(rough_token_count(src) + 64))
+                    except Exception:
+                        est_tokens = 128
+                    try:
+                        req_bucket.acquire(1.0)
+                        tok_bucket.acquire(float(est_tokens))
+                    except Exception:
+                        pass
+                    try:
+                        # 直接复用 qwen_translate_single 的翻译 prompt，只是换成兜底模型；
+                        # 不传任何 enable_thinking / thinking_budget 之类的额外参数。
+                        backend = fallback_cli or cli
+                        tr = qwen_translate_single(backend, fallback_model, src, timeout=translate_timeout) if backend else ""
+                    except Exception as exc:
+                        logger.info(f"兜底翻译出错: {exc}")
+                        tr = ''
+                    outs[idx] = (tr or '').strip()
+                # 每轮兜底后重新检查哪些段落仍然看起来“没有翻译成功”
+                pending = [idx for idx in pending if not _looks_translated(batch[idx], outs[idx])]
+                if pending and fb_round < fallback_translate_attempts:
+                    logger.warning(
+                        f"兜底翻译重试 {fb_round}/{fallback_translate_attempts}，剩余 {len(pending)} 个片段待处理"
+                    )
 
         if pending:
             logger.warning(

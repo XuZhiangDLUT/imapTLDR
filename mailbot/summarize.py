@@ -174,19 +174,28 @@ def summarize_once(cfg: dict, folder: str | None = None, batch: int = 5):
                 # mock 模式仅使用本地模拟摘要
                 summ, thinking, meta_extra = ("- mock summary", "", {})
             else:
-                summ, thinking, meta_extra = deepseek_summarize(
-                    cli,
-                    model,
-                    prompt,
-                    snippet,
-                    enable_thinking,
-                    thinking_budget,
-                    timeout=timeout,
-                    expect_json=bool(task.get("expect_json", True)),
-                    provider=provider_kind,
-                    stream=bool(task.get("stream", False)),
-                    reasoning_effort=reasoning_effort,
-                )
+                # 主模型共有 main_attempts 次调用机会，失败后先重试再考虑兜底
+                main_attempts = max(1, int(cfg.get('summarize', {}).get('main_attempts', 2)))
+                for main_attempt in range(1, main_attempts + 1):
+                    summ, thinking, meta_extra = deepseek_summarize(
+                        cli,
+                        model,
+                        prompt,
+                        snippet,
+                        enable_thinking,
+                        thinking_budget,
+                        timeout=timeout,
+                        expect_json=bool(task.get("expect_json", True)),
+                        provider=provider_kind,
+                        stream=bool(task.get("stream", False)),
+                        reasoning_effort=reasoning_effort,
+                    )
+                    if summ != "(summary timeout or error)":
+                        break
+                    if main_attempt < main_attempts:
+                        logger.warning(
+                            f"Summarize-once 主模型失败，重试 {main_attempt + 1}/{main_attempts}"
+                        )
 
                 # 主模型失败时，尝试 summarize_fallback
                 if summ == "(summary timeout or error)" and fallback_model and fallback_cli is not None:
