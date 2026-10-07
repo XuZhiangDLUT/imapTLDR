@@ -4,8 +4,9 @@ from typing import Iterable
 from openai import OpenAI
 from bs4 import BeautifulSoup, NavigableString
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 import json
+import os
 from pathlib import Path as _Path
 from premailer import transform as inline_css
 import re
@@ -444,6 +445,187 @@ def _segment_needs_translation(text: str | None) -> bool:
     if not text:
         return False
     return bool(_ASCII_RE.search(text))
+
+
+_SUMMARIZED_INBOX_PATH = _DATA_DIR / 'summarized_inbox.json'
+_SUMMARIZED_INBOX_TTL_DAYS = 90
+
+
+def _load_summarized_inbox() -> dict:
+    """读取 INBOX 原件的总结完成记录（键 -> 完成时间）。"""
+    try:
+        data = json.loads(_SUMMARIZED_INBOX_PATH.read_text(encoding='utf-8'))
+        if isinstance(data, dict):
+            return data
+    except Exception:
+        pass
+    return {}
+
+
+def _write_inbox_state(path: Path, data: dict) -> bool:
+    """原子保存协调状态；失败必须显式返回，不能声称已经登记。"""
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix('.json.tmp')
+        with tmp.open('w', encoding='utf-8') as stream:
+            json.dump(data, stream, ensure_ascii=False, indent=1)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(tmp, path)
+        return True
+    except (OSError, ValueError) as exc:
+        logger.warning("写入 INBOX 协调状态失败: %s (%s)", path.name, type(exc).__name__)
+        return False
+
+
+def _save_summarized_inbox(records: dict) -> bool:
+    """保存完成记录；摘要邮件与恢复日志用于处理写入失败及进程中断。"""
+    cutoff = (datetime.now() - timedelta(days=_SUMMARIZED_INBOX_TTL_DAYS)).isoformat(timespec='seconds')
+    pruned = {k: v for k, v in records.items() if str(v) >= cutoff}
+    return _write_inbox_state(_SUMMARIZED_INBOX_PATH, pruned)
+
+
+_SUMMARIZED_INBOX_PENDING_PATH = _DATA_DIR / 'summarized_inbox_pending.json'
+_SUMMARY_STATE_HEADER = 'X-IMAPTLDR-Summary-State'
+_SUMMARY_KEYS_HEADER = 'X-IMAPTLDR-Summary-Keys'
+
+
+def _load_pending_inbox_summary() -> dict:
+    try:
+        pending = json.loads(_SUMMARIZED_INBOX_PENDING_PATH.read_text(encoding='utf-8'))
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError) as exc:
+        raise RuntimeError("无法读取 INBOX 摘要恢复日志，暂停写出以避免重复摘要") from exc
+    if pending == {}:
+        return {}
+    if (not isinstance(pending, dict) or pending.get('folder') != 'INBOX'
+            or not isinstance(pending.get('message_id'), str) or not pending['message_id']
+            or not isinstance(pending.get('keys'), list) or not pending['keys']
+            or not all(isinstance(k, str) and k for k in pending['keys'])
+            or not isinstance(pending.get('completed_at'), str)):
+        raise RuntimeError("INBOX 摘要恢复日志格式异常，暂停写出以避免重复摘要")
+    return pending
+
+
+def _prepare_inbox_summary(c, folder: str, out, keys: list[str]) -> dict:
+    """先保存写出意图；摘要存在但完成记录未落盘时可按 Message-ID 恢复。"""
+    if _load_pending_inbox_summary():
+        raise RuntimeError("尚有待恢复的 INBOX 摘要，不能覆盖恢复日志")
+    completed_at = datetime.now().isoformat(timespec='seconds')
+    status = c.folder_status(folder, [b'UIDNEXT', b'UIDVALIDITY'])
+    pending = {
+        'folder': folder,
+        'message_id': str(out['Message-ID']),
+        'keys': keys,
+        'completed_at': completed_at,
+        'first_uid': int(status.get(b'UIDNEXT') or status.get('UIDNEXT') or 0),
+        'uidvalidity': str(status.get(b'UIDVALIDITY') or status.get('UIDVALIDITY') or ''),
+    }
+    out[_SUMMARY_STATE_HEADER] = 'completed-v1'
+    out[_SUMMARY_KEYS_HEADER] = json.dumps(keys, ensure_ascii=True)
+    if not _write_inbox_state(_SUMMARIZED_INBOX_PENDING_PATH, pending):
+        raise OSError("摘要恢复日志未保存，暂不写出摘要并保留原件")
+    return pending
+
+
+def _inbox_summary_candidate_uids(c, pending: dict) -> list[int]:
+    """QQ 的 Message-ID SEARCH 会静默漏报；枚举 UID 范围后本地核对。"""
+    status = c.select_folder('INBOX', readonly=True)
+    uidnext = status.get(b'UIDNEXT') or status.get('UIDNEXT')
+    if not isinstance(uidnext, int) or uidnext < 1:
+        status.update(c.folder_status('INBOX', [b'UIDNEXT', b'UIDVALIDITY']))
+        uidnext = status.get(b'UIDNEXT') or status.get('UIDNEXT')
+    if not isinstance(uidnext, int) or uidnext < 1:
+        raise OSError("无法确认 INBOX UID 上界，保留摘要恢复日志等待重试")
+    uidv = str(status.get(b'UIDVALIDITY') or status.get('UIDVALIDITY') or '')
+    lower = 1
+    first_uid = pending.get('first_uid')
+    if (uidv and uidv == pending.get('uidvalidity')
+            and isinstance(first_uid, int) and first_uid > 0):
+        lower = first_uid
+    upper = uidnext - 1
+    # 不使用 first_uid:*：空范围在 IMAP 中可能反向匹配最后一封旧邮件。
+    if lower > upper:
+        return []
+    uids = c.search(['UID', f'{lower}:{upper}'])
+    if not isinstance(uids, (list, tuple)) or not all(isinstance(uid, int) for uid in uids):
+        raise OSError("INBOX UID 查询结果异常，保留摘要恢复日志等待重试")
+    return sorted({uid for uid in uids if lower <= uid <= upper})
+
+
+def _recover_inbox_summary(c, records: dict, *, require_checkpoint: bool = False) -> dict:
+    """按 UID 范围核对上次写出的摘要，补登记；不依赖服务端邮件头搜索。"""
+    pending = _load_pending_inbox_summary()
+    if not pending:
+        return records
+    keys = pending['keys']
+    if not all(k in records for k in keys):
+        uids = _inbox_summary_candidate_uids(c, pending)
+        found = False
+        for offset in range(0, len(uids), 100):
+            requested = uids[offset:offset + 100]
+            headers = c.fetch(requested, [b'BODY.PEEK[HEADER]'])
+            for uid in requested:
+                data = headers.get(uid)
+                raw = data.get(b'BODY[HEADER]') if isinstance(data, dict) else None
+                if (not isinstance(raw, bytes) or not raw.strip()
+                        or (b'\r\n\r\n' not in raw and b'\n\n' not in raw)):
+                    raise OSError("摘要候选邮件头读取不完整，保留恢复日志等待重试")
+                header = parse_message(raw)
+                if str(header.get('Message-ID', '')).strip() != pending['message_id']:
+                    continue
+                if str(header.get(_SUMMARY_STATE_HEADER, '')) != 'completed-v1':
+                    raise RuntimeError("摘要邮件已存在但完成标识异常，保留恢复日志")
+                try:
+                    linked_keys = json.loads(str(header.get(_SUMMARY_KEYS_HEADER, '')))
+                except ValueError as exc:
+                    raise RuntimeError("摘要邮件已存在但原件标识无法解析，保留恢复日志") from exc
+                if linked_keys != keys:
+                    raise RuntimeError("摘要邮件原件标识与恢复日志不一致，保留恢复日志")
+                found = True
+                break
+            if found:
+                break
+        if not found:
+            if not _write_inbox_state(_SUMMARIZED_INBOX_PENDING_PATH, {}):
+                raise OSError("待写出摘要不存在，但恢复日志无法更新；保留原件等待重试")
+            logger.info("待恢复的 INBOX 摘要尚未写出，原件将重新尝试总结")
+            return records
+        records.update({k: pending['completed_at'] for k in keys})
+        if not _save_summarized_inbox(records):
+            logger.warning("已核对摘要存在，但本地完成记录仍未保存；保留恢复日志")
+            if require_checkpoint:
+                raise OSError("INBOX 完成记录未保存，暂停新增摘要以保留恢复日志")
+            return records
+        logger.info("已从现有摘要恢复 INBOX 总结完成记录: %s 封", len(keys))
+    if not _write_inbox_state(_SUMMARIZED_INBOX_PENDING_PATH, {}) and require_checkpoint:
+        raise OSError("无法清空已完成的摘要恢复日志，暂停新增摘要")
+    return records
+
+
+def _summarize_inbox_keywords(cfg: dict) -> list[str]:
+    cfg_sum = cfg.get('summarize', {}) or {}
+    return [str(k).strip() for k in (cfg_sum.get('inbox_keywords', []) or []) if str(k).strip()]
+
+
+def _inbox_needs_summary(sub: str, cfg: dict) -> bool:
+    """与 summarize_job 的 INBOX 关键字通道同一判定：主题包含任一总结关键字。"""
+    return any(k in (sub or '') for k in _summarize_inbox_keywords(cfg))
+
+
+def _inbox_summary_key(msg, fallback_key: str) -> str:
+    """INBOX 原件标识：优先 Message-ID，缺失时退回 邮箱|文件夹|UIDVALIDITY|UID。"""
+    return str(msg.get('Message-ID') or '').strip() or fallback_key
+
+
+def _folder_uidvalidity(c, folder: str) -> str:
+    try:
+        st = c.folder_status(folder, [b'UIDVALIDITY'])
+        val = st.get(b'UIDVALIDITY') or st.get('UIDVALIDITY')
+        return str(val or '')
+    except Exception:
+        return ''
 
 
 def _looks_translated(src: str | None, dst: str | None) -> bool:
@@ -1130,10 +1312,14 @@ def summarize_job(cfg: dict):
 
     _maybe_save([])
     try:
+        summarized_inbox = _load_summarized_inbox()
         for plan in scan_plans:
             folder = str(plan.get('folder') or 'INBOX')
             scan_mode = str(plan.get('mode') or 'folder')
             mark_seen_after_summary = bool(plan.get('mark_seen_after_summary', True))
+            uidv = _folder_uidvalidity(c, folder) if scan_mode == 'inbox_keyword' else ''
+            if scan_mode == 'inbox_keyword':
+                summarized_inbox = _recover_inbox_summary(c, summarized_inbox, require_checkpoint=True)
 
             if scan_mode == 'inbox_keyword':
                 logger.info(f"扫描总结 INBOX 关键字通道: {','.join(inbox_keywords)}")
@@ -1160,6 +1346,10 @@ def summarize_job(cfg: dict):
                     continue
                 if scan_mode == 'inbox_keyword':
                     if not any(k in sub for k in inbox_keywords):
+                        continue
+                    rec_key = _inbox_summary_key(msg, f"{imap['email']}|{folder}|{uidv}|{uid}")
+                    if rec_key in summarized_inbox:
+                        logger.info(f"跳过已总结的 INBOX 原件: {sub} (uid={uid})")
                         continue
                     logger.info(f"INBOX 总结关键字命中: {sub} (uid={uid})")
                 logger.info(f"待总结邮件: {sub} (uid={uid})")
@@ -1277,6 +1467,14 @@ def summarize_job(cfg: dict):
                                 entry[key] = meta_extra[key]
                     submitted_entries.append(entry)
 
+                    # INBOX 协调只认整封总结成功；错误文本和空结果不能放行归档。
+                    if scan_mode == 'inbox_keyword' and (
+                        not (summary or '').strip() or '(summary timeout or error)' in summary
+                    ):
+                        summary_output_valid = False
+                        invalid_reasons.append(f'model-failed-chunk-{idx + 1}')
+                        break
+
                     # Normalize parsed output shape:
                     # - expected: {"articles": [...], "no_match_reason": "..."}
                     # - observed in the wild: [...] (list as root)
@@ -1335,7 +1533,7 @@ def summarize_job(cfg: dict):
 
                 if not summary_output_valid:
                     logger.warning(
-                        f"总结输出格式异常，跳过生成总结邮件并保留原邮件未读以便重试: {sub} (uid={uid}) | reasons={','.join(invalid_reasons) or 'unknown'}"
+                        f"总结未成功完成，跳过生成总结邮件并保留原邮件未读以便重试: {sub} (uid={uid}) | reasons={','.join(invalid_reasons) or 'unknown'}"
                     )
                     try:
                         mark_unseen(c, folder, uid)
@@ -1374,12 +1572,25 @@ def summarize_job(cfg: dict):
                 folder_label = "INBOX关键词" if scan_mode == 'inbox_keyword' else folder
                 subject = f"{pref.get('summarize','[机器总结]')} {folder_label}（{len(batch)}封）"
                 out = build_email(subject, imap['email'], imap['email'], html, None)
+                pending = None
+                if scan_mode == 'inbox_keyword':
+                    keys = [_inbox_summary_key(m, f"{imap['email']}|{folder}|{uidv}|{uid}")
+                            for uid, m, _ in batch]
+                    pending = _prepare_inbox_summary(c, folder, out, keys)
                 append_unseen(c, folder, out)
                 logger.info(f"已写入总结邮件: {subject}")
                 if mark_seen_after_summary:
                     for uid, _, _ in batch:
                         mark_seen(c, folder, uid)
                 else:
+                    # 总结结果邮件已成功写入，此时才登记完成记录；翻译侧据此放行原件归档
+                    assert pending is not None
+                    summarized_inbox.update({k: pending['completed_at'] for k in pending['keys']})
+                    if not _save_summarized_inbox(summarized_inbox):
+                        raise OSError("摘要已写入，但完成记录未保存；保留恢复日志供下轮核对")
+                    logger.info(f"已登记 INBOX 总结完成记录: {len(pending['keys'])} 封")
+                    if not _write_inbox_state(_SUMMARIZED_INBOX_PENDING_PATH, {}):
+                        raise OSError("摘要完成记录已保存，但恢复日志无法清空；暂停新增摘要")
                     logger.info(f"INBOX 关键字总结通道保留原邮件未读: {len(batch)} 封")
                 # checkpoint after each batch
                 _meta['entries_written'] = len(submitted_entries)
@@ -1881,6 +2092,7 @@ def translate_job(cfg: dict):
 
     c = connect(imap['server'], imap['email'], imap['password'], port=imap.get('port',993), ssl=imap.get('ssl',True))
     try:
+        summarized_inbox = _recover_inbox_summary(c, _load_summarized_inbox())
         for folder, uid, msg in scan_translate_targets(c, cfg, excluded):
             sub = decode_subject(msg)
             logger.info(f"处理翻译邮件: {sub} | 文件夹={folder} | uid={uid}")
@@ -1892,11 +2104,23 @@ def translate_job(cfg: dict):
                 mark_seen(c, folder, uid)
                 continue
 
+            def _defer_archive_for_summary() -> bool:
+                """INBOX 原件需要总结且尚未完成时暂缓清理，保留未读等待机器总结。"""
+                if folder != 'INBOX' or not _inbox_needs_summary(sub, cfg):
+                    return False
+                rec_key = _inbox_summary_key(msg, f"{imap['email']}|INBOX|{_folder_uidvalidity(c, 'INBOX')}|{uid}")
+                if rec_key in summarized_inbox:
+                    return False
+                logger.info(f"总结未完成，暂缓清理 INBOX 原件: {sub} (uid={uid})")
+                return True
+
             # idempotency: skip if already handled（若未开启 force_retranslate）
             orig_msgid = msg.get('Message-ID') or ''
             if not force_retranslate:
                 if orig_msgid and has_linked_reply(c, folder, orig_msgid, pref.get('translate','[机器翻译]')):
                     logger.info("跳过已翻译邮件（幂等检查）")
+                    if _defer_archive_for_summary():
+                        continue
                     mark_seen(c, folder, uid)
                     if delete_translated:
                         try:
@@ -2018,6 +2242,9 @@ def translate_job(cfg: dict):
             out = build_email(new_subject, imap['email'], imap['email'], zh_html, None, in_reply_to=msg.get('Message-ID'))
             target_folder = folder or 'INBOX'
             append_unseen(c, target_folder, out)
+            logger.info(f"已写入翻译邮件: {new_subject}")
+            if _defer_archive_for_summary():
+                continue
             mark_seen(c, target_folder, uid)
             if delete_translated:
                 try:
@@ -2025,7 +2252,6 @@ def translate_job(cfg: dict):
                     logger.info(f"已移动原始邮件到 Junk: {sub} (uid={uid}, folder={dst})")
                 except Exception as e:
                     logger.info(f"移动原始邮件到 Junk 失败: {sub} (uid={uid}) -> {e}")
-            logger.info(f"已写入翻译邮件: {new_subject}")
     finally:
         try:
             c.logout()
